@@ -3,20 +3,59 @@ const catalog = window.__SHOWROOM_CATALOG__ ?? []
 const root = document.getElementById('showroom')
 const SPEEDS = [0.5, 1, 2]
 const SCALES = [1, 2, 3, 4]
-const XTERM_VERSION = '6.0.0'
-
-const role = {
-  assistant: { copy: '#fff8dc', glyph: '┊', tone: '#cd7f32' },
-  system: { copy: '#cc9b1f', glyph: '·', tone: '#cc9b1f' },
-  tool: { copy: '#cc9b1f', glyph: '⚡', tone: '#cd7f32' },
-  user: { copy: '#daa520', glyph: '❯', tone: '#ffd700' }
-}
 
 const escapeHtml = value =>
   String(value ?? '').replace(
-    /[&<>"']/g,
+    /[&<>\"']/g,
     char => ({ '&': '&amp;', '"': '&quot;', "'": '&#39;', '<': '&lt;', '>': '&gt;' })[char]
   )
+
+// Minimal ANSI-to-HTML: handles ESC[NC (cursor forward), strips control sequences.
+// No color SGR support needed — all styling comes from the Ink renderer's own output.
+const ansiToHtml = raw => {
+  let out = ''
+  let i = 0
+
+  while (i < raw.length) {
+    if (raw[i] === '\x1b' && raw[i + 1] === '[') {
+      let j = i + 2
+
+      while (j < raw.length && raw[j] >= '0' && raw[j] <= '9') j++
+      if (j < raw.length && raw[j] === ';') j++
+      while (j < raw.length && raw[j] >= '0' && raw[j] <= '9') j++
+
+      if (j < raw.length) {
+        const cmd = raw[j]
+
+        if (cmd === 'C') {
+          const n = parseInt(raw.slice(i + 2, j), 10) || 1
+          out += ' '.repeat(n)
+        }
+
+        // All other sequences (cursor hide/show, bracketed paste, etc.) — strip
+        i = j + 1
+        continue
+      }
+    }
+
+    if (raw[i] === '\r' && raw[i + 1] === '\n') {
+      out += '\n'
+      i += 2
+      continue
+    }
+
+    if (raw[i] === '\r') {
+      out += '\n'
+      i++
+      continue
+    }
+
+    out += raw[i]
+    i++
+  }
+
+  return out
+}
 
 const state = {
   body: null,
@@ -33,8 +72,6 @@ const state = {
   startedAt: 0,
   statusLeft: null,
   statusRight: null,
-  term: null,
-  termContainer: null,
   timers: [],
   total: 0,
   viewport: null,
@@ -135,7 +172,13 @@ const message = action => {
     return
   }
 
-  const spec = role[action.role] ?? role.assistant
+  const roleSpec = {
+    assistant: { copy: '#fff8dc', glyph: '┊', tone: '#cd7f32' },
+    system: { copy: '#cc9b1f', glyph: '·', tone: '#cc9b1f' },
+    tool: { copy: '#cc9b1f', glyph: '⚡', tone: '#cd7f32' },
+    user: { copy: '#daa520', glyph: '❯', tone: '#ffd700' }
+  }
+  const spec = roleSpec[action.role] ?? roleSpec.assistant
   const line = document.createElement('div')
   const glyph = document.createElement('span')
   const copy = document.createElement('div')
@@ -184,14 +227,18 @@ const tool = action => {
 }
 
 const frame = action => {
-  if (!state.term || !action.ansi) {
+  if (!action.ansi) {
     return
   }
 
-  state.term.write(action.ansi)
+  const pre = document.createElement('pre')
+  pre.className = 'showroom-frame'
+  pre.dataset.target = action.id ?? ''
+  pre.innerHTML = escapeHtml(ansiToHtml(action.ansi))
+  state.body.append(pre)
 
   if (action.id) {
-    state.frameTargets.set(action.id, state.termContainer)
+    state.frameTargets.set(action.id, pre)
   }
 }
 
@@ -258,14 +305,6 @@ const compose = action => setText(state.composer, action.text ?? '', action.dura
 const clearTranscript = () => {
   state.overlays.textContent = ''
   state.frameTargets.clear()
-
-  if (state.frameMode && state.term) {
-    state.term.reset()
-    state.term.write('\x1b[?25l')
-
-    return
-  }
-
   state.body.textContent = ''
 }
 
@@ -293,62 +332,6 @@ const tickProgress = () => {
   if (elapsed < state.total) {
     state.raf = requestAnimationFrame(tickProgress)
   }
-}
-
-const ensureXtermStylesheet = () => {
-  const id = 'xterm-css'
-
-  if (document.getElementById(id)) {
-    return
-  }
-
-  const link = document.createElement('link')
-  link.id = id
-  link.rel = 'stylesheet'
-  link.href = `https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VERSION}/css/xterm.css`
-  document.head.append(link)
-}
-
-const initXterm = async () => {
-  ensureXtermStylesheet()
-  const mod = await import(`https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VERSION}/+esm`)
-  const { Terminal } = mod
-
-  state.term = new Terminal({
-    cols: state.viewport.cols,
-    rows: state.viewport.rows,
-    fontFamily: 'JetBrains Mono, "SF Mono", Consolas, monospace',
-    fontSize: 13,
-    cursorBlink: false,
-    scrollback: 0,
-    convertEol: true,
-    allowProposedApi: true,
-    theme: {
-      background: '#0a0a0a',
-      foreground: '#fff8dc',
-      cursor: '#ffd700',
-      selectionBackground: '#3a3a55',
-      black: '#0a0a0a',
-      red: '#ef5350',
-      green: '#8fbc8f',
-      yellow: '#ffd700',
-      blue: '#5a82ff',
-      magenta: '#cd7f32',
-      cyan: '#daa520',
-      white: '#fff8dc',
-      brightBlack: '#cc9b1f',
-      brightRed: '#ef5350',
-      brightGreen: '#8fbc8f',
-      brightYellow: '#ffbf00',
-      brightBlue: '#5a82ff',
-      brightMagenta: '#cd7f32',
-      brightCyan: '#daa520',
-      brightWhite: '#fff8dc'
-    }
-  })
-
-  state.term.open(state.termContainer)
-  state.term.write('\x1b[?25l')
 }
 
 const play = () => {
@@ -444,12 +427,11 @@ const buildSegmented = (values, active) =>
 
 const computeViewport = () => {
   const fromWorkflow = state.workflow.viewport ?? {}
-  const usesFrames = (state.workflow.timeline ?? []).some(a => a.type === 'frame')
 
   return {
-    cellWidth: usesFrames ? 9 : 8,
+    cellWidth: 8,
     cols: 80,
-    lineHeight: usesFrames ? 19 : 18,
+    lineHeight: 18,
     rows: 24,
     scale: 2,
     ...fromWorkflow
@@ -481,7 +463,7 @@ const renderShell = () => {
       <div class="showroom-overlays"></div>
     </div>
     <footer class="showroom-controls">
-      <button type="button" data-action="restart" title="restart (R)">↻</button>
+      <button type="button" data-action="restart" title="restart (R)">&#8635;</button>
       <span class="showroom-segmented" data-segment="scale">${buildSegmented(SCALES, state.scale)}</span>
       <span class="showroom-segmented" data-segment="speed">${buildSegmented(SPEEDS, state.speed)}</span>
       ${catalog.length > 1 ? `<select class="showroom-picker" data-action="picker">${buildOptions()}</select>` : ''}
@@ -517,24 +499,11 @@ const renderShell = () => {
       void loadWorkflow(event.target.value)
     })
   }
-
-  if (state.frameMode) {
-    state.body.innerHTML = '<div class="showroom-xterm" data-target="terminal"></div>'
-    state.termContainer = state.body.querySelector('.showroom-xterm')
-  } else {
-    state.term = null
-    state.termContainer = null
-  }
 }
 
 const rebuild = async () => {
   renderShell()
   setScale(state.workflow.viewport?.scale ?? fitScale())
-
-  if (state.frameMode) {
-    await initXterm()
-  }
-
   play()
 }
 

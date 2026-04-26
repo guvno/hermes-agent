@@ -1,6 +1,6 @@
 # TUI Showroom
 
-Scripted demos of `ui-tui`. Workflows snapshot real ui-tui components (`MessageLine`, `Panel`, `Box`, `Text`) into ANSI and replay them through xterm.js with cinematic overlays. Recorded once, played any number of times — built for screen capture.
+Scripted demos of `ui-tui`. Workflows snapshot real ui-tui components (`MessageLine`, `Panel`, `Box`, `Text`) into ANSI and replay them in the browser with cinematic overlays. Recorded once, played any number of times — built for screen capture.
 
 ```bash
 npm run showroom            # dev server at http://127.0.0.1:4317
@@ -30,12 +30,12 @@ record.tsx           ─┐
 workflows/<name>.json
                      │  served at /api/workflow/<name>
                      ▼
-showroom.js          │  xterm.js writes ANSI; DOM overlays target frame ids
+showroom.js          │  ANSI parser + DOM overlays targeting frame ids
                      ▼
 browser
 ```
 
-`frame` actions embed ANSI from an Ink render; the browser feeds them into `@xterm/xterm` (jsDelivr CDN) so the surface is the actual TUI. Captions, spotlights, highlights, and fades are DOM overlays anchored to frame `id`s.
+`frame` actions embed ANSI from an Ink render; the browser parses them into `<pre>` elements with a lightweight converter. Captions, spotlights, highlights, and fades are DOM overlays anchored to frame `id`s. No CDN dependencies — zero network latency.
 
 ## Timeline actions
 
