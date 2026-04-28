@@ -31,7 +31,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
-from agent.account_usage import fetch_account_usage, render_account_usage_lines
+# NOTE: `from agent.account_usage import ...` is deliberately NOT at module
+# top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
+# needed when the user runs `/limits`. Lazy-imported inside the handler.
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -7944,6 +7946,8 @@ class GatewayRunner:
         # block the gateway. Failures are non-fatal -- account_lines stays [].
         account_lines: list[str] = []
         if provider:
+            # Lazy import — pulls the OpenAI SDK chain, only needed here.
+            from agent.account_usage import fetch_account_usage, render_account_usage_lines
             try:
                 account_snapshot = await asyncio.to_thread(
                     fetch_account_usage,
