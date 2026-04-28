@@ -924,7 +924,38 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     print(f"Kanban dispatcher running (interval={args.interval}s, pid={os.getpid()}). "
           f"Ctrl-C to stop.")
 
+    # Health telemetry: warn when every tick finds ready work but fails to
+    # spawn any worker. Catches broken profiles, PATH drift, missing venv,
+    # credential loss — cases where the per-task circuit breaker auto-blocks
+    # each task quietly but the operator has no signal that the dispatcher
+    # itself is dysfunctional.
+    HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
+    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+
     def _on_tick(res):
+        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        spawned_any = bool(res.spawned)
+        if ready_pending and not spawned_any:
+            health_state["bad_ticks"] += 1
+        else:
+            health_state["bad_ticks"] = 0
+        # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
+        # so log volume stays bounded while the problem persists.
+        if health_state["bad_ticks"] >= HEALTH_WINDOW:
+            now = int(time.time())
+            # Rate-limit repeats: at most one warning per 5 minutes.
+            if now - health_state["last_warn_at"] >= 300:
+                print(
+                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
+                    f"ready queue non-empty for {health_state['bad_ticks']} "
+                    f"consecutive ticks but 0 workers spawned successfully. "
+                    f"Check profile health (venv, PATH, credentials) and "
+                    f"`hermes kanban list --status ready` / "
+                    f"`hermes kanban list --status blocked` for recent "
+                    f"spawn_failed tasks.",
+                    file=sys.stderr, flush=True,
+                )
+                health_state["last_warn_at"] = now
         if not verbose:
             return
         did_work = (
@@ -940,6 +971,20 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,
             )
+
+    def _ready_queue_nonempty() -> bool:
+        """Cheap SELECT — just asks whether there's at least one ready
+        task with an assignee that the dispatcher could have picked up."""
+        try:
+            with kb.connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM tasks "
+                    "WHERE status = 'ready' AND assignee IS NOT NULL "
+                    "    AND claim_lock IS NULL LIMIT 1"
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
 
     try:
         kb.run_daemon(

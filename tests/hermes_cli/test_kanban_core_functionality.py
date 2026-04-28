@@ -1762,3 +1762,162 @@ def test_cli_show_json_carries_runs(kanban_home):
     # Events also carry run_id field.
     for e in data["events"]:
         assert "run_id" in e
+
+
+# -------------------------------------------------------------------------
+# Pre-merge audit by @erosika (issue #16102 comment 4331125835) — fixes
+# -------------------------------------------------------------------------
+
+def test_unblock_invariant_recovery(kanban_home):
+    """unblock_task must leave current_run_id NULL even if some other
+    code path left it dangling. Engineer the leak, verify recovery."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="unblock invariant", assignee="worker")
+        # Start on running, then open a run, then force to 'blocked' but
+        # leave current_run_id pointing at the open run — simulate the
+        # invariant violation erosika flagged.
+        kb.claim_task(conn, tid)
+        leaked_run_id = kb.latest_run(conn, tid).id
+        # Force the bad state.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        # current_run_id is still set; run is still open.
+        assert kb.get_task(conn, tid).current_run_id == leaked_run_id
+        assert kb.get_run(conn, leaked_run_id).ended_at is None
+
+        # Unblock — the defensive recovery must close the leaked run.
+        assert kb.unblock_task(conn, tid) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        leaked = kb.get_run(conn, leaked_run_id)
+        assert leaked.outcome == "reclaimed"
+        assert leaked.ended_at is not None
+    finally:
+        conn.close()
+
+
+def test_unblock_normal_path_no_spurious_run(kanban_home):
+    """Happy path: claim -> block -> unblock. Unblock must be a no-op
+    on runs (block_task already closed the run cleanly)."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="normal unblock", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.block_task(conn, tid, reason="pause")
+        runs_before = len(kb.list_runs(conn, tid))
+        assert kb.unblock_task(conn, tid) is True
+        runs_after = len(kb.list_runs(conn, tid))
+        # No new run created by the happy-path unblock.
+        assert runs_after == runs_before
+        # Task in ready with cleared pointer.
+        t = kb.get_task(conn, tid)
+        assert t.status == "ready"
+        assert t.current_run_id is None
+    finally:
+        conn.close()
+
+
+def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
+    """init_db must be safe to re-run repeatedly. Each call should leave
+    at most one run row per in-flight task, even if called while a
+    dispatcher is simultaneously claiming."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    # Fresh DB, one task left in 'running' with a claim but no run row.
+    # Simulates a pre-runs-era DB.
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy inflight", assignee="worker")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='old', "
+            "claim_expires=?, started_at=?, current_run_id=NULL WHERE id=?",
+            (now + 900, now, tid),
+        )
+        # Drop any synthetic run the normal claim path would have made.
+        conn.execute("DELETE FROM task_runs WHERE task_id=?", (tid,))
+        conn.commit()
+
+        # Re-run init_db 3x — each should detect the orphan-inflight and
+        # install exactly ONE run row, not three.
+        for _ in range(3):
+            kb.init_db()
+
+        runs = kb.list_runs(conn, tid)
+        assert len(runs) == 1, f"expected exactly 1 backfilled run, got {len(runs)}"
+        # Pointer should be installed.
+        assert kb.get_task(conn, tid).current_run_id == runs[0].id
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_includes_role_history(kanban_home):
+    """build_worker_context must surface recent completed runs for the
+    same assignee, giving cross-task continuity."""
+    conn = kb.connect()
+    try:
+        # Three completed tasks for 'reviewer'
+        for i, (title, summary) in enumerate([
+            ("Review security PR #1", "approved, focus on CSRF"),
+            ("Review security PR #2", "requested changes: SQL injection vector"),
+            ("Review security PR #3", "approved, rate-limit added"),
+        ]):
+            tid = kb.create_task(conn, title=title, assignee="reviewer")
+            kb.claim_task(conn, tid)
+            kb.complete_task(conn, tid, summary=summary)
+
+        # Now a NEW task for reviewer, not yet done
+        new_tid = kb.create_task(
+            conn, title="Review perf PR", assignee="reviewer",
+        )
+        ctx = kb.build_worker_context(conn, new_tid)
+
+        assert "## Recent work by @reviewer" in ctx
+        assert "Review security PR #3" in ctx
+        assert "approved, rate-limit added" in ctx
+        # Current task should be excluded from its own recent work list.
+        assert "Review perf PR" not in ctx.split("## Recent work by")[1]
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_role_history_skipped_when_no_assignee(kanban_home):
+    """If task has no assignee, the role-history section is omitted."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan task")
+        # Force no assignee (create_task already defaults to None).
+        ctx = kb.build_worker_context(conn, tid)
+        assert "## Recent work by" not in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_role_history_bounded_to_5(kanban_home):
+    """Role history must be capped at 5 entries even when the assignee
+    has many completed tasks."""
+    conn = kb.connect()
+    try:
+        for i in range(10):
+            tid = kb.create_task(
+                conn, title=f"prior #{i}", assignee="worker",
+            )
+            kb.claim_task(conn, tid)
+            kb.complete_task(conn, tid, summary=f"done #{i}")
+
+        new_tid = kb.create_task(conn, title="new", assignee="worker")
+        ctx = kb.build_worker_context(conn, new_tid)
+        # Section should exist and contain exactly 5 bullet lines.
+        section = ctx.split("## Recent work by @worker")[1]
+        bullets = [l for l in section.splitlines() if l.startswith("- ")]
+        assert len(bullets) == 5, f"expected 5 bullets, got {len(bullets)}"
+    finally:
+        conn.close()

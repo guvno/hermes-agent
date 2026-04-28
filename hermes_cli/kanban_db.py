@@ -436,40 +436,56 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
-    # calls have something to write to. Safe to re-run: the check below
-    # skips tasks that already have a current_run_id.
+    # calls have something to write to. Wrapped in write_txn to serialize
+    # against any concurrent dispatcher, and the per-row UPDATE uses
+    # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
+    # produce an orphaned row if it interleaves with the backfill pass.
     runs_exist = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        inflight = conn.execute(
-            "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-            "       max_runtime_seconds, last_heartbeat_at, started_at "
-            "FROM tasks "
-            "WHERE status = 'running' AND (current_run_id IS NULL)"
-        ).fetchall()
-        for row in inflight:
-            started = row["started_at"] or int(time.time())
-            cur = conn.execute(
-                """
-                INSERT INTO task_runs (
-                    task_id, profile, status,
-                    claim_lock, claim_expires, worker_pid,
-                    max_runtime_seconds, last_heartbeat_at,
-                    started_at
-                ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"], row["assignee"], row["claim_lock"],
-                    row["claim_expires"], row["worker_pid"],
-                    row["max_runtime_seconds"], row["last_heartbeat_at"],
-                    started,
-                ),
-            )
-            conn.execute(
-                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-                (cur.lastrowid, row["id"]),
-            )
+        with write_txn(conn):
+            inflight = conn.execute(
+                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "       max_runtime_seconds, last_heartbeat_at, started_at "
+                "FROM tasks "
+                "WHERE status = 'running' AND current_run_id IS NULL"
+            ).fetchall()
+            for row in inflight:
+                started = row["started_at"] or int(time.time())
+                cur = conn.execute(
+                    """
+                    INSERT INTO task_runs (
+                        task_id, profile, status,
+                        claim_lock, claim_expires, worker_pid,
+                        max_runtime_seconds, last_heartbeat_at,
+                        started_at
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"], row["assignee"], row["claim_lock"],
+                        row["claim_expires"], row["worker_pid"],
+                        row["max_runtime_seconds"], row["last_heartbeat_at"],
+                        started,
+                    ),
+                )
+                # CAS: only install the pointer if nothing else claimed
+                # the task between our SELECT and here (shouldn't happen
+                # under the write_txn, but belt-and-suspenders). If the
+                # CAS fails we've got an orphan run_row — mark it
+                # reclaimed so it doesn't look in-flight.
+                upd = conn.execute(
+                    "UPDATE tasks SET current_run_id = ? "
+                    "WHERE id = ? AND current_run_id IS NULL",
+                    (cur.lastrowid, row["id"]),
+                )
+                if upd.rowcount != 1:
+                    conn.execute(
+                        "UPDATE task_runs SET status = 'reclaimed', "
+                        "    outcome = 'reclaimed', ended_at = ? "
+                        "WHERE id = ?",
+                        (int(time.time()), cur.lastrowid),
+                    )
 
     # One-shot event-kind rename pass. The old names ("ready", "priority",
     # "spawn_auto_blocked") still worked but were awkward on the wire;
@@ -1356,10 +1372,36 @@ def block_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked -> ready``."""
+    """Transition ``blocked -> ready``.
+
+    Defensively closes any stale ``current_run_id`` pointer before flipping
+    status. In the common path (``block_task`` closed the run already) this
+    is a no-op. If a future or external write left the pointer dangling,
+    the leaked run is closed as ``reclaimed`` inside the same txn so the
+    runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
+    state) holds for the rest of this function's lifetime.
+    """
+    now = int(time.time())
     with write_txn(conn):
+        stale = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'blocked'",
+            (task_id,),
+        ).fetchone()
+        if stale and stale["current_run_id"]:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'reclaimed', outcome = 'reclaimed',
+                       summary = COALESCE(summary, 'invariant recovery on unblock'),
+                       ended_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND ended_at IS NULL
+                """,
+                (now, int(stale["current_run_id"])),
+            )
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'blocked'",
+            "UPDATE tasks SET status = 'ready', current_run_id = NULL "
+            "WHERE id = ? AND status = 'blocked'",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -2098,6 +2140,32 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 except Exception:
                     pass
             lines.extend(body_lines)
+            lines.append("")
+
+    # Cross-task role history: what else has THIS assignee completed
+    # recently? Gives the worker implicit continuity — "I'm the reviewer
+    # and my last three reviews focused on security" — without forcing
+    # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
+    # most recent 5 completed runs, excluding this task so the retry
+    # section above isn't duplicated. Safe on assignee=None (skipped).
+    if task.assignee:
+        role_rows = conn.execute(
+            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+            "WHERE r.profile = ? AND r.task_id != ? "
+            "  AND r.outcome = 'completed' "
+            "ORDER BY r.ended_at DESC LIMIT 5",
+            (task.assignee, task_id),
+        ).fetchall()
+        if role_rows:
+            lines.append(f"## Recent work by @{task.assignee}")
+            for row in role_rows:
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
+                )
+                s = (row["summary"] or "").strip().splitlines()
+                first = s[0][:200] if s else "(no summary)"
+                lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
             lines.append("")
 
     comments = list_comments(conn, task_id)

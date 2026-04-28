@@ -2490,6 +2490,23 @@ class GatewayRunner:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        # Terminal event kinds trigger automatic unsubscription — the task
+        # is done, blocked, or in a retry-needed state that the human
+        # shouldn't keep pinging a stale chat for. Previously we only
+        # unsubbed when task.status in ('done', 'archived'), which left
+        # subscriptions on 'blocked' / 'gave_up' / 'crashed' / 'timed_out'
+        # tasks stranded forever.
+        TERMINAL_EVENT_KINDS = TERMINAL_KINDS
+        # Per-subscription send-failure counter. Adapter.send raising
+        # means the chat is dead (deleted, bot kicked, etc.) — after N
+        # consecutive send failures the sub is dropped so we don't spin
+        # against a dead chat every 5 seconds forever.
+        MAX_SEND_FAILURES = 3
+        sub_fail_counts: dict[tuple, int] = getattr(
+            self, "_kanban_sub_fail_counts", {}
+        )
+        self._kanban_sub_fail_counts = sub_fail_counts
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -2546,6 +2563,11 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
+                        # Identity prefix: attribute terminal pings to the
+                        # worker that did the work. Makes fleets (where one
+                        # chat subscribes to many tasks) legible at a glance.
+                        who = (task.assignee if task and task.assignee else None)
+                        tag = f"@{who} " if who else ""
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -2563,25 +2585,25 @@ class GatewayRunner:
                                 r = task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -2589,7 +2611,7 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         else:
@@ -2597,15 +2619,33 @@ class GatewayRunner:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        sub_key = (
+                            sub["task_id"], sub["platform"],
+                            sub["chat_id"], sub.get("thread_id") or "",
+                        )
                         try:
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
+                            # Reset the failure counter on success.
+                            sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            fails = sub_fail_counts.get(sub_key, 0) + 1
+                            sub_fail_counts[sub_key] = fails
                             logger.warning(
-                                "kanban notifier: send failed for %s on %s: %s",
-                                sub["task_id"], platform_str, exc,
+                                "kanban notifier: send failed for %s on %s "
+                                "(attempt %d/%d): %s",
+                                sub["task_id"], platform_str, fails,
+                                MAX_SEND_FAILURES, exc,
                             )
+                            if fails >= MAX_SEND_FAILURES:
+                                logger.warning(
+                                    "kanban notifier: dropping subscription "
+                                    "%s on %s after %d consecutive send failures",
+                                    sub["task_id"], platform_str, fails,
+                                )
+                                await asyncio.to_thread(self._kanban_unsub, sub)
+                                sub_fail_counts.pop(sub_key, None)
                             # Don't advance cursor on send failure — retry next tick.
                             break
                     else:
@@ -2613,7 +2653,15 @@ class GatewayRunner:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"],
                         )
-                        if task and task.status in ("done", "archived"):
+                        # Unsubscribe when the LAST delivered event is a
+                        # terminal kind (the task hit a "no further updates"
+                        # state), not just on task.status in {done, archived}.
+                        # Covers blocked / gave_up / crashed / timed_out which
+                        # used to leak subs forever.
+                        last_kind = d["events"][-1].kind if d["events"] else None
+                        task_terminal = task and task.status in ("done", "archived")
+                        event_terminal = last_kind in TERMINAL_EVENT_KINDS
+                        if task_terminal or event_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub,
                             )
