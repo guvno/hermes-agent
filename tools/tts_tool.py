@@ -10,6 +10,7 @@ Supports seven TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- Piper HTTP (local, free, no API key): Local Piper server returning WAV bytes
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -98,6 +99,9 @@ DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_TTS_POSTPROCESS_ENABLED = False
+DEFAULT_TTS_POSTPROCESS_PRESET = "none"
+TTS_POSTPROCESS_PRESETS = {"none", "clean", "hybrid", "dark", "cyber_autotune"}
 DEFAULT_MINIMAX_MODEL = "speech-2.8-hd"
 DEFAULT_MINIMAX_VOICE_ID = "English_Graceful_Lady"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -111,6 +115,15 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_PIPER_BASE_URL = "http://127.0.0.1:5005"
+DEFAULT_PIPER_TIMEOUT = 60
+DEFAULT_PIPER_HEALTH_TIMEOUT = 2
+DEFAULT_MELOTTS_PYTHON = "/home/ubuntu/melotts-venv/bin/python"
+DEFAULT_MELOTTS_LANGUAGE = "KR"
+DEFAULT_MELOTTS_SPEAKER = "KR"
+DEFAULT_MELOTTS_DEVICE = "cpu"
+DEFAULT_MELOTTS_SPEED = 1.0
+DEFAULT_MELOTTS_TIMEOUT = 180
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -139,6 +152,8 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
+    "piper": 2000,        # local Piper server, Korean model quality falls off on long text
+    "melotts": 2000,      # local MeloTTS subprocess, keep latency bounded
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -267,6 +282,133 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     return None
 
 
+def _ffmpeg_has_filter(filter_name: str) -> bool:
+    """Return True if the local ffmpeg build exposes *filter_name*."""
+    if not _has_ffmpeg():
+        return False
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and re.search(rf"\s{re.escape(filter_name)}\s", result.stdout) is not None
+
+
+def _tts_effect_filter(preset: str) -> Optional[str]:
+    """Build a conservative ffmpeg filter chain for lab-AI TTS effects."""
+    preset = (preset or "none").lower().strip()
+    if preset in ("", "none", "off", "false"):
+        return None
+    if preset not in TTS_POSTPROCESS_PRESETS:
+        raise ValueError(
+            f"Unknown TTS postprocess preset: {preset}. "
+            f"Expected one of: {', '.join(sorted(TTS_POSTPROCESS_PRESETS))}"
+        )
+
+    # On this host rubberband has previously produced near-silent output in
+    # some chains, so only use it when the user explicitly allows it.
+    use_rubberband = os.getenv("HERMES_TTS_USE_RUBBERBAND", "").lower() in {"1", "true", "yes"}
+    pitch = ""
+    if use_rubberband and _ffmpeg_has_filter("rubberband"):
+        pitch_by_preset = {"clean": "0.96", "hybrid": "0.90", "dark": "0.84", "cyber_autotune": "1.06"}
+        pitch = f"rubberband=pitch={pitch_by_preset[preset]}:formant=preserved:tempo=1.0,"
+
+    if preset == "cyber_autotune":
+        # Based on openclaw/skills globalcaos/jarvis-voice's metallic ffmpeg
+        # chain, adapted for Hermes/OpenAI's 48 kHz Opus path and Korean TTS.
+        # Keep bitcrusher/acrusher out; the Jarvis-style character comes from
+        # +5% asetrate pitch, strong flanger, short echo, highpass, and treble.
+        if not pitch:
+            pitch = "asetrate=48000*1.05,aresample=48000,atempo=0.952,"
+        body = (
+            "flanger=delay=0:depth=2:regen=50:width=71:speed=0.5,"
+            "aecho=0.8:0.88:15:0.5,"
+            "highpass=f=200,"
+            "treble=g=6,"
+            "atempo=1.25,"
+            "loudnorm=I=-16:TP=-1.5:LRA=6"
+        )
+    elif preset == "clean":
+        body = (
+            "highpass=f=120,lowpass=f=6500,"
+            "equalizer=f=900:t=q:w=1.2:g=1.5,"
+            "equalizer=f=2600:t=q:w=1.1:g=2.0,"
+            "flanger=delay=1.2:depth=1.5:regen=8:width=18:speed=0.12,"
+            "aecho=0.82:0.88:12:0.08,"
+            "acrusher=bits=12:samples=4:mix=0.04,"
+            "loudnorm=I=-16:TP=-1.5:LRA=8"
+        )
+    elif preset == "hybrid":
+        body = (
+            "highpass=f=140,lowpass=f=5400,"
+            "equalizer=f=850:t=q:w=1.2:g=2.5,"
+            "equalizer=f=2400:t=q:w=1.0:g=3.5,"
+            "equalizer=f=4200:t=q:w=1.5:g=1.5,"
+            "tremolo=f=34:d=0.055,"
+            "vibrato=f=2.2:d=0.035,"
+            "flanger=delay=1.8:depth=2.4:regen=14:width=32:speed=0.16,"
+            "aecho=0.80:0.88:9|19:0.12|0.06,"
+            "acrusher=bits=10:samples=8:mix=0.09,"
+            "loudnorm=I=-16:TP=-1.5:LRA=7"
+        )
+    else:  # dark
+        body = (
+            "highpass=f=160,lowpass=f=4600,"
+            "equalizer=f=700:t=q:w=1.0:g=3.0,"
+            "equalizer=f=1800:t=q:w=1.0:g=2.0,"
+            "equalizer=f=2900:t=q:w=1.0:g=4.5,"
+            "tremolo=f=48:d=0.12,"
+            "vibrato=f=3.1:d=0.055,"
+            "flanger=delay=2.4:depth=3.8:regen=24:width=48:speed=0.22,"
+            "aecho=0.78:0.90:6|13|27:0.18|0.10|0.05,"
+            "acrusher=bits=9:samples=12:mix=0.16,"
+            "loudnorm=I=-16:TP=-1.5:LRA=6"
+        )
+    return f"{pitch}{body}"
+
+
+def _apply_tts_postprocess(audio_path: str, tts_config: Dict[str, Any]) -> Optional[str]:
+    """Apply optional ffmpeg postprocessing before the file is delivered."""
+    post_cfg = tts_config.get("postprocess", {})
+    if not isinstance(post_cfg, dict):
+        return None
+    enabled = bool(post_cfg.get("enabled", DEFAULT_TTS_POSTPROCESS_ENABLED))
+    preset = str(post_cfg.get("preset", DEFAULT_TTS_POSTPROCESS_PRESET)).lower().strip()
+    if not enabled or preset in ("", "none", "off", "false"):
+        return None
+    if not _has_ffmpeg():
+        logger.warning("TTS postprocess requested but ffmpeg is not available")
+        return None
+
+    filter_chain = _tts_effect_filter(preset)
+    if not filter_chain:
+        return None
+
+    src = Path(audio_path)
+    out = src.with_name(f"{src.stem}_{preset}{src.suffix}")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-y", "-i", str(src),
+        "-af", filter_chain, "-ar", "48000", "-ac", "1",
+    ]
+    if out.suffix.lower() == ".ogg":
+        cmd += ["-c:a", "libopus", "-b:a", "64k", "-vbr", "off"]
+    cmd.append(str(out))
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        logger.warning("TTS postprocess preset %s timed out", preset)
+        return None
+    if result.returncode != 0:
+        logger.warning("TTS postprocess preset %s failed: %s", preset, result.stderr[-500:])
+        return None
+    if out.exists() and out.stat().st_size > 0:
+        return str(out)
+    return None
+
+
 # ===========================================================================
 # Provider: Edge TTS (free)
 # ===========================================================================
@@ -365,6 +507,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
     base_url = oai_config.get("base_url", base_url)
     speed = float(oai_config.get("speed", tts_config.get("speed", 1.0)))
+    instructions = str(oai_config.get("instructions", "")).strip()
 
     # Determine response format from extension
     if output_path.endswith(".ogg"):
@@ -384,6 +527,8 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         )
         if speed != 1.0:
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
+        if instructions:
+            create_kwargs["instructions"] = instructions
         response = client.audio.speech.create(**create_kwargs)
 
         response.stream_to_file(output_path)
@@ -912,6 +1057,172 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: Piper HTTP (local server, e.g. piper-rs-server)
+# ===========================================================================
+def _get_piper_base_url(tts_config: Dict[str, Any]) -> str:
+    """Return the configured Piper HTTP base URL without a trailing slash."""
+    piper_config = tts_config.get("piper", {}) if isinstance(tts_config.get("piper"), dict) else {}
+    return str(piper_config.get("base_url") or DEFAULT_PIPER_BASE_URL).rstrip("/")
+
+
+def _check_piper_available(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Check whether the configured Piper HTTP server responds to /health."""
+    import urllib.request
+
+    config = tts_config or _load_tts_config()
+    piper_config = config.get("piper", {}) if isinstance(config.get("piper"), dict) else {}
+    base_url = _get_piper_base_url(config)
+    timeout = piper_config.get("health_timeout", DEFAULT_PIPER_HEALTH_TIMEOUT)
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_PIPER_HEALTH_TIMEOUT
+
+    try:
+        request = urllib.request.Request(f"{base_url}/health", method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(4096)
+        return b"ok" in body.lower() or body.strip() in (b"true", b"1")
+    except Exception:
+        return False
+
+
+def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech by POSTing text to a local Piper HTTP server.
+
+    The server is expected to expose:
+      * GET /health -> JSON/text health signal
+      * POST /tts {"text": "..."} -> audio/wav bytes
+
+    If *output_path* is not .wav, ffmpeg converts the returned WAV to the
+    requested extension so the rest of the TTS pipeline can stay provider-agnostic.
+    """
+    import urllib.error
+    import urllib.request
+
+    piper_config = tts_config.get("piper", {}) if isinstance(tts_config.get("piper"), dict) else {}
+    base_url = _get_piper_base_url(tts_config)
+    timeout = piper_config.get("timeout", DEFAULT_PIPER_TIMEOUT)
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_PIPER_TIMEOUT
+
+    payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/tts",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            wav_bytes = response.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")[:500]
+        raise ValueError(f"Piper TTS server returned HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise FileNotFoundError(f"Piper TTS server not reachable at {base_url}: {e}") from e
+
+    if not wav_bytes:
+        raise ValueError("Piper TTS server returned an empty audio response")
+
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    with open(wav_path, "wb") as f:
+        f.write(wav_bytes)
+
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30)
+            os.remove(wav_path)
+        else:
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
+# Provider: MeloTTS (local subprocess in an isolated virtualenv)
+# ===========================================================================
+def _get_melotts_config(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized MeloTTS provider config."""
+    raw = tts_config.get("melotts", {}) if isinstance(tts_config.get("melotts"), dict) else {}
+    return {
+        "python": str(raw.get("python") or raw.get("python_path") or DEFAULT_MELOTTS_PYTHON),
+        "language": str(raw.get("language") or DEFAULT_MELOTTS_LANGUAGE),
+        "speaker": str(raw.get("speaker") or DEFAULT_MELOTTS_SPEAKER),
+        "device": str(raw.get("device") or DEFAULT_MELOTTS_DEVICE),
+        "speed": raw.get("speed", DEFAULT_MELOTTS_SPEED),
+        "timeout": raw.get("timeout", DEFAULT_MELOTTS_TIMEOUT),
+    }
+
+
+def _check_melotts_available(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Check whether the configured MeloTTS Python executable exists."""
+    config = _get_melotts_config(tts_config or _load_tts_config())
+    py = config["python"]
+    return bool(py and os.path.exists(py) and os.access(py, os.X_OK))
+
+
+def _generate_melotts_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech with MeloTTS via a separate Python environment.
+
+    MeloTTS pulls in Torch and older text-processing dependencies. Running it
+    in its own venv avoids contaminating the main Hermes runtime.
+    """
+    cfg = _get_melotts_config(tts_config)
+    try:
+        speed = float(cfg["speed"])
+    except (TypeError, ValueError):
+        speed = DEFAULT_MELOTTS_SPEED
+    try:
+        timeout = float(cfg["timeout"])
+    except (TypeError, ValueError):
+        timeout = DEFAULT_MELOTTS_TIMEOUT
+
+    py = cfg["python"]
+    if not os.path.exists(py):
+        raise FileNotFoundError(f"MeloTTS Python executable not found: {py}")
+
+    output = Path(output_path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    repo_root = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else str(repo_root)
+
+    cmd = [
+        py,
+        "-m",
+        "tools.melotts_runner",
+        "--language",
+        cfg["language"],
+        "--speaker",
+        cfg["speaker"],
+        "--speed",
+        str(speed),
+        "--device",
+        cfg["device"],
+        "--text",
+        text,
+        "--output",
+        str(output),
+    ]
+    subprocess.run(cmd, check=True, timeout=timeout, env=env)
+
+    if not output.exists() or output.stat().st_size == 0:
+        raise FileNotFoundError(f"MeloTTS produced no output: {output}")
+    return str(output)
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -1048,6 +1359,26 @@ def text_to_speech_tool(
             logger.info("Generating speech with KittenTTS (local, ~25MB)...")
             _generate_kittentts(text, file_str, tts_config)
 
+        elif provider == "piper":
+            logger.info("Generating speech with Piper HTTP TTS (local)...")
+            piper_output = file_str
+            # Piper returns WAV. If the caller requested .ogg, synthesize WAV first
+            # and let the shared Opus conversion path create Telegram voice audio.
+            if file_str.endswith(".ogg"):
+                piper_output = str(file_path.with_suffix(".wav"))
+            _generate_piper_tts(text, piper_output, tts_config)
+            file_str = piper_output
+
+        elif provider == "melotts":
+            logger.info("Generating speech with MeloTTS (local)...")
+            melotts_output = file_str
+            # MeloTTS returns WAV. If the caller requested .ogg, synthesize WAV first
+            # and let the shared Opus conversion path create Telegram voice audio.
+            if file_str.endswith(".ogg"):
+                melotts_output = str(file_path.with_suffix(".wav"))
+            _generate_melotts_tts(text, melotts_output, tts_config)
+            file_str = melotts_output
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -1084,10 +1415,15 @@ def text_to_speech_tool(
                 "error": f"TTS generation produced no output (provider: {provider})"
             }, ensure_ascii=False)
 
+        postprocessed = _apply_tts_postprocess(file_str, tts_config)
+        if postprocessed:
+            file_str = postprocessed
+
         # Try Opus conversion for Telegram compatibility
-        # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
+        # Edge TTS outputs MP3; NeuTTS/KittenTTS/Piper/MeloTTS output WAV; MiniMax/xAI
+        # output MP3. All need ffmpeg conversion for Telegram voice bubbles.
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "piper", "melotts") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -1173,6 +1509,10 @@ def check_tts_requirements() -> bool:
     if _check_neutts_available():
         return True
     if _check_kittentts_available():
+        return True
+    if _check_piper_available():
+        return True
+    if _check_melotts_available():
         return True
     return False
 
@@ -1461,6 +1801,8 @@ if __name__ == "__main__":
         except ImportError:
             return False
 
+    config = _load_tts_config()
+
     print("\nProvider availability:")
     print(f"  Edge TTS:   {'installed' if _check(_import_edge_tts, 'edge') else 'not installed (pip install edge-tts)'}")
     print(f"  ElevenLabs: {'installed' if _check(_import_elevenlabs, 'el') else 'not installed (pip install elevenlabs)'}")
@@ -1471,10 +1813,10 @@ if __name__ == "__main__":
         f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
     print(f"  MiniMax:    {'API key set' if os.getenv('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
+    print(f"  Piper HTTP: {'available' if _check_piper_available(config) else 'not reachable'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 
-    config = _load_tts_config()
     provider = _get_provider(config)
     print(f"  Configured provider: {provider}")
 

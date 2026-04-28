@@ -108,6 +108,56 @@ class TestOpenaiTtsSpeed:
         kwargs = create.call_args[1]
         assert kwargs["speed"] == 4.0
 
+    def test_instructions_passed_when_configured(self, tmp_path, monkeypatch):
+        """gpt-4o-mini-tts supports style instructions; pass them through."""
+        create = self._run({"openai": {"instructions": "Speak calmly."}}, tmp_path, monkeypatch)
+        kwargs = create.call_args[1]
+        assert kwargs["instructions"] == "Speak calmly."
+
+    def test_empty_instructions_not_passed(self, tmp_path, monkeypatch):
+        """Avoid sending blank instructions."""
+        create = self._run({"openai": {"instructions": "   "}}, tmp_path, monkeypatch)
+        kwargs = create.call_args[1]
+        assert "instructions" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# TTS postprocess presets
+# ---------------------------------------------------------------------------
+
+class TestTtsPostprocessPresets:
+    def test_known_presets_build_filters(self):
+        from tools.tts_tool import _tts_effect_filter
+
+        for preset in ("clean", "hybrid", "dark"):
+            filt = _tts_effect_filter(preset)
+            assert "loudnorm" in filt
+            assert "acrusher" in filt
+
+    def test_cyber_autotune_uses_jarvis_voice_chain_without_bitcrusher(self):
+        from tools.tts_tool import _tts_effect_filter
+
+        filt = _tts_effect_filter("cyber_autotune")
+        assert "asetrate=48000*1.05" in filt
+        assert "flanger=delay=0:depth=2:regen=50:width=71:speed=0.5" in filt
+        assert "aecho=0.8:0.88:15:0.5" in filt
+        assert "highpass=f=200" in filt
+        assert "treble=g=6" in filt
+        assert "atempo=1.25" in filt
+        assert "loudnorm" in filt
+        assert "acrusher" not in filt
+
+    def test_none_preset_has_no_filter(self):
+        from tools.tts_tool import _tts_effect_filter
+
+        assert _tts_effect_filter("none") is None
+
+    def test_unknown_preset_rejected(self):
+        from tools.tts_tool import _tts_effect_filter
+
+        with pytest.raises(ValueError):
+            _tts_effect_filter("explode")
+
 
 # ---------------------------------------------------------------------------
 # MiniMax TTS speed (global fallback wired)

@@ -207,7 +207,9 @@ class TestCheckTtsRequirementsMistral:
         with patch("tools.tts_tool._import_edge_tts", side_effect=ImportError), \
              patch("tools.tts_tool._import_elevenlabs", side_effect=ImportError), \
              patch("tools.tts_tool._import_openai_client", side_effect=ImportError), \
-             patch("tools.tts_tool._check_neutts_available", return_value=False):
+             patch("tools.tts_tool._check_neutts_available", return_value=False), \
+             patch("tools.tts_tool._check_piper_available", return_value=False), \
+             patch("tools.tts_tool._check_melotts_available", return_value=False):
             assert check_tts_requirements() is True
 
     def test_mistral_key_missing_returns_false(self, mock_mistral_module):
@@ -216,5 +218,7 @@ class TestCheckTtsRequirementsMistral:
         with patch("tools.tts_tool._import_edge_tts", side_effect=ImportError), \
              patch("tools.tts_tool._import_elevenlabs", side_effect=ImportError), \
              patch("tools.tts_tool._import_openai_client", side_effect=ImportError), \
-             patch("tools.tts_tool._check_neutts_available", return_value=False):
+             patch("tools.tts_tool._check_neutts_available", return_value=False), \
+             patch("tools.tts_tool._check_piper_available", return_value=False), \
+             patch("tools.tts_tool._check_melotts_available", return_value=False):
             assert check_tts_requirements() is False

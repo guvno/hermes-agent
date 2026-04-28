@@ -149,6 +149,7 @@ class TestPriorityProcessingModels(unittest.TestCase):
     def test_vendor_prefix_stripped(self):
         from hermes_cli.models import model_supports_fast_mode
 
+        assert model_supports_fast_mode("openai/gpt-5.5") is True
         assert model_supports_fast_mode("openai/gpt-5.4") is True
         assert model_supports_fast_mode("openai/gpt-4.1") is True
         assert model_supports_fast_mode("openai/o3") is True
@@ -170,6 +171,9 @@ class TestPriorityProcessingModels(unittest.TestCase):
 
     def test_resolve_overrides_returns_service_tier(self):
         from hermes_cli.models import resolve_fast_mode_overrides
+
+        result = resolve_fast_mode_overrides("gpt-5.5")
+        assert result == {"service_tier": "priority"}
 
         result = resolve_fast_mode_overrides("gpt-5.4")
         assert result == {"service_tier": "priority"}

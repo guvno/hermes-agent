@@ -743,9 +743,9 @@ DEFAULT_CONFIG = {
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
     # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
-    # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
+    # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS/Piper/MeloTTS 2000).
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" | "kittentts" | "piper" | "melotts"
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -757,7 +757,13 @@ DEFAULT_CONFIG = {
         "openai": {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
-            # Voices: alloy, echo, fable, onyx, nova, shimmer
+            "instructions": "",  # Supported by gpt-4o-mini-tts for style/tone control
+            # Voices include alloy, ash, ballad, coral, echo, fable, nova, onyx,
+            # sage, shimmer, verse, marin, cedar. API/model decides support.
+        },
+        "postprocess": {
+            "enabled": False,
+            "preset": "none",  # none, clean, hybrid, dark, cyber_autotune
         },
         "xai": {
             "voice_id": "eve",
@@ -774,6 +780,19 @@ DEFAULT_CONFIG = {
             "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
             "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
             "device": "cpu",  # cpu, cuda, or mps
+        },
+        "piper": {
+            "base_url": "http://127.0.0.1:5005",  # Local Piper HTTP server
+            "timeout": 60,
+            "health_timeout": 2,
+        },
+        "melotts": {
+            "python": "/home/ubuntu/melotts-venv/bin/python",  # Isolated MeloTTS venv
+            "language": "KR",
+            "speaker": "KR",
+            "device": "cpu",
+            "speed": 1.0,
+            "timeout": 180,
         },
     },
     
