@@ -1392,14 +1392,22 @@ def text_to_speech_tool(
 
             if edge_available:
                 logger.info("Generating speech with Edge TTS...")
+                # Edge TTS always writes MP3 bytes regardless of the extension
+                # requested by the caller.  When Telegram requests .ogg, synthesize
+                # MP3 first so optional postprocessing runs on a correctly named
+                # container, then convert the final result to OGG/Opus below.
+                edge_output = file_str
+                if edge_output.endswith(".ogg"):
+                    edge_output = str(Path(edge_output).with_suffix(".mp3"))
                 try:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                            lambda: asyncio.run(_generate_edge_tts(text, edge_output, tts_config))
                         ).result(timeout=60)
                 except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                    asyncio.run(_generate_edge_tts(text, edge_output, tts_config))
+                file_str = edge_output
             elif _check_neutts_available():
                 logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
                 provider = "neutts"
