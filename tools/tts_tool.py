@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from urllib.parse import urljoin
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_dir
 
 logger = logging.getLogger(__name__)
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -126,6 +126,7 @@ DEFAULT_GOOGLE_CLOUD_VOICE = "ko-KR-Chirp3-HD-Kore"
 DEFAULT_GOOGLE_CLOUD_AUDIO_ENCODING = "LINEAR16"
 DEFAULT_GOOGLE_CLOUD_SPEAKING_RATE = 1.0
 DEFAULT_GOOGLE_CLOUD_PITCH = 0.0
+DEFAULT_GOOGLE_CLOUD_MONTHLY_CHARACTER_LIMIT = 1_000_000
 DEFAULT_PIPER_BASE_URL = "http://127.0.0.1:5005"
 DEFAULT_PIPER_TIMEOUT = 60
 DEFAULT_PIPER_HEALTH_TIMEOUT = 2
@@ -954,6 +955,87 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 
+def _google_cloud_usage_month(now: Optional[datetime.datetime] = None) -> str:
+    """Return the UTC usage bucket month for Google Cloud TTS metering."""
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    return current.strftime("%Y-%m")
+
+
+def _google_cloud_usage_path(tts_config: Dict[str, Any]) -> Path:
+    """Return the persistent local usage counter path for Google Cloud TTS."""
+    gc_config = tts_config.get("google_cloud", {}) if isinstance(tts_config.get("google_cloud"), dict) else {}
+    configured = str(gc_config.get("usage_path") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_dir("state/tts", "tts_usage") / "google_cloud_usage.json"
+
+
+def _google_cloud_monthly_limit(tts_config: Dict[str, Any]) -> int:
+    """Return the configured Google Cloud TTS monthly character limit."""
+    gc_config = tts_config.get("google_cloud", {}) if isinstance(tts_config.get("google_cloud"), dict) else {}
+    limit = gc_config.get("monthly_character_limit", DEFAULT_GOOGLE_CLOUD_MONTHLY_CHARACTER_LIMIT)
+    if isinstance(limit, bool):
+        return DEFAULT_GOOGLE_CLOUD_MONTHLY_CHARACTER_LIMIT
+    try:
+        parsed = int(limit)
+    except (TypeError, ValueError):
+        return DEFAULT_GOOGLE_CLOUD_MONTHLY_CHARACTER_LIMIT
+    return parsed if parsed > 0 else DEFAULT_GOOGLE_CLOUD_MONTHLY_CHARACTER_LIMIT
+
+
+def _read_google_cloud_usage(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the local Google Cloud TTS usage counter, resetting stale months."""
+    month = _google_cloud_usage_month()
+    path = _google_cloud_usage_path(tts_config)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"month": month, "characters": 0}
+
+    if not isinstance(data, dict) or data.get("month") != month:
+        return {"month": month, "characters": 0}
+    try:
+        characters = int(data.get("characters", 0))
+    except (TypeError, ValueError):
+        characters = 0
+    return {"month": month, "characters": max(0, characters)}
+
+
+def _write_google_cloud_usage(tts_config: Dict[str, Any], usage: Dict[str, Any]) -> None:
+    """Persist the local Google Cloud TTS usage counter atomically."""
+    path = _google_cloud_usage_path(tts_config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(usage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _ensure_google_cloud_monthly_quota(text: str, tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Raise before calling the paid API if this request would exceed quota."""
+    limit = _google_cloud_monthly_limit(tts_config)
+    usage = _read_google_cloud_usage(tts_config)
+    requested = len(text)
+    projected = usage["characters"] + requested
+    if projected > limit:
+        remaining = max(0, limit - usage["characters"])
+        raise ValueError(
+            "Google Cloud TTS monthly character limit would be exceeded: "
+            f"used {usage['characters']:,}/{limit:,}, requested {requested:,}, "
+            f"remaining {remaining:,}."
+        )
+    return usage
+
+
+def _record_google_cloud_usage(text: str, tts_config: Dict[str, Any], prior_usage: Optional[Dict[str, Any]] = None) -> None:
+    """Record characters after a successful Google Cloud TTS synthesis."""
+    usage = prior_usage or _read_google_cloud_usage(tts_config)
+    current_month = _google_cloud_usage_month()
+    if usage.get("month") != current_month:
+        usage = {"month": current_month, "characters": 0}
+    usage["characters"] = int(usage.get("characters", 0)) + len(text)
+    _write_google_cloud_usage(tts_config, usage)
+
+
 # ===========================================================================
 # Provider: Google Cloud Text-to-Speech (Chirp 3 HD)
 # ===========================================================================
@@ -976,6 +1058,8 @@ def _generate_google_cloud_tts(text: str, output_path: str, tts_config: Dict[str
     ).strip().upper() or DEFAULT_GOOGLE_CLOUD_AUDIO_ENCODING
     speaking_rate = float(gc_config.get("speaking_rate", tts_config.get("speed", DEFAULT_GOOGLE_CLOUD_SPEAKING_RATE)))
     pitch = float(gc_config.get("pitch", DEFAULT_GOOGLE_CLOUD_PITCH))
+
+    quota_usage = _ensure_google_cloud_monthly_quota(text, tts_config)
 
     texttospeech = _import_google_cloud_tts()
     audio_encoding = getattr(texttospeech.AudioEncoding, encoding_name, None)
@@ -1002,6 +1086,7 @@ def _generate_google_cloud_tts(text: str, output_path: str, tts_config: Dict[str
 
     with open(output_path, "wb") as f:
         f.write(audio_content)
+    _record_google_cloud_usage(text, tts_config, quota_usage)
     return output_path
 
 # ===========================================================================

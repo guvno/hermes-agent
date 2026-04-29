@@ -142,3 +142,118 @@ def test_google_cloud_has_default_text_limit():
 
     assert PROVIDER_MAX_TEXT_LENGTH["google_cloud"] == 5000
     assert _resolve_max_text_length("google_cloud", {}) == 5000
+
+
+def test_google_cloud_records_successful_monthly_character_usage(monkeypatch, tmp_path):
+    from tools import tts_tool as _tt
+
+    monkeypatch.setattr(_tt, "_google_cloud_usage_month", lambda: "2026-04")
+    monkeypatch.setattr(_tt, "_google_cloud_usage_path", lambda config: tmp_path / "usage.json")
+
+    class FakeTextToSpeechClient:
+        def synthesize_speech(self, request):
+            return SimpleNamespace(audio_content=b"RIFF fake wav")
+
+    class FakeTextToSpeech:
+        TextToSpeechClient = FakeTextToSpeechClient
+        SynthesisInput = lambda self, text: {"text": text}
+        VoiceSelectionParams = lambda self, language_code, name: {
+            "language_code": language_code,
+            "name": name,
+        }
+        AudioConfig = lambda self, audio_encoding, speaking_rate, pitch: {
+            "audio_encoding": audio_encoding,
+            "speaking_rate": speaking_rate,
+            "pitch": pitch,
+        }
+        AudioEncoding = SimpleNamespace(LINEAR16="LINEAR16", MP3="MP3")
+
+    monkeypatch.setattr(_tt, "_import_google_cloud_tts", lambda: FakeTextToSpeech())
+
+    _tt._generate_google_cloud_tts("가나다", str(tmp_path / "out.wav"), {})
+
+    usage = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
+    assert usage == {"month": "2026-04", "characters": 3}
+
+
+def test_google_cloud_monthly_character_limit_blocks_before_api_call(monkeypatch, tmp_path):
+    from tools import tts_tool as _tt
+
+    usage_path = tmp_path / "usage.json"
+    usage_path.write_text(json.dumps({"month": "2026-04", "characters": 999_998}), encoding="utf-8")
+    monkeypatch.setattr(_tt, "_google_cloud_usage_month", lambda: "2026-04")
+    monkeypatch.setattr(_tt, "_google_cloud_usage_path", lambda config: usage_path)
+
+    called = {"api": False}
+
+    class FakeTextToSpeechClient:
+        def synthesize_speech(self, request):
+            called["api"] = True
+            return SimpleNamespace(audio_content=b"RIFF fake wav")
+
+    class FakeTextToSpeech:
+        TextToSpeechClient = FakeTextToSpeechClient
+        SynthesisInput = lambda self, text: {"text": text}
+        VoiceSelectionParams = lambda self, language_code, name: {
+            "language_code": language_code,
+            "name": name,
+        }
+        AudioConfig = lambda self, audio_encoding, speaking_rate, pitch: {
+            "audio_encoding": audio_encoding,
+            "speaking_rate": speaking_rate,
+            "pitch": pitch,
+        }
+        AudioEncoding = SimpleNamespace(LINEAR16="LINEAR16", MP3="MP3")
+
+    monkeypatch.setattr(_tt, "_import_google_cloud_tts", lambda: FakeTextToSpeech())
+
+    try:
+        _tt._generate_google_cloud_tts("초과됨", str(tmp_path / "out.wav"), {})
+    except ValueError as e:
+        assert "monthly character limit" in str(e)
+        assert "1,000,000" in str(e)
+    else:
+        raise AssertionError("Expected monthly quota ValueError")
+
+    assert called["api"] is False
+    assert json.loads(usage_path.read_text(encoding="utf-8"))["characters"] == 999_998
+
+
+def test_google_cloud_monthly_character_limit_can_be_configured(monkeypatch, tmp_path):
+    from tools import tts_tool as _tt
+
+    usage_path = tmp_path / "usage.json"
+    usage_path.write_text(json.dumps({"month": "2026-04", "characters": 10}), encoding="utf-8")
+    monkeypatch.setattr(_tt, "_google_cloud_usage_month", lambda: "2026-04")
+    monkeypatch.setattr(_tt, "_google_cloud_usage_path", lambda config: usage_path)
+
+    class FakeTextToSpeechClient:
+        def synthesize_speech(self, request):
+            return SimpleNamespace(audio_content=b"RIFF fake wav")
+
+    class FakeTextToSpeech:
+        TextToSpeechClient = FakeTextToSpeechClient
+        SynthesisInput = lambda self, text: {"text": text}
+        VoiceSelectionParams = lambda self, language_code, name: {
+            "language_code": language_code,
+            "name": name,
+        }
+        AudioConfig = lambda self, audio_encoding, speaking_rate, pitch: {
+            "audio_encoding": audio_encoding,
+            "speaking_rate": speaking_rate,
+            "pitch": pitch,
+        }
+        AudioEncoding = SimpleNamespace(LINEAR16="LINEAR16", MP3="MP3")
+
+    monkeypatch.setattr(_tt, "_import_google_cloud_tts", lambda: FakeTextToSpeech())
+    config = {"google_cloud": {"monthly_character_limit": 20}}
+
+    _tt._generate_google_cloud_tts("12345", str(tmp_path / "ok.wav"), config)
+    assert json.loads(usage_path.read_text(encoding="utf-8"))["characters"] == 15
+
+    try:
+        _tt._generate_google_cloud_tts("123456", str(tmp_path / "blocked.wav"), config)
+    except ValueError as e:
+        assert "20" in str(e)
+    else:
+        raise AssertionError("Expected configured monthly quota ValueError")

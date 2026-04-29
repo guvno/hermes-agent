@@ -782,6 +782,8 @@ DEFAULT_CONFIG = {
             "audio_encoding": "LINEAR16",  # Hermes converts WAV/LINEAR16 to Telegram OGG/Opus
             "speaking_rate": 1.0,
             "pitch": 0.0,
+            "monthly_character_limit": 1000000,  # Stay within Google Cloud TTS monthly free tier
+            "usage_path": "",  # Empty = ~/.hermes/state/tts/google_cloud_usage.json
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
