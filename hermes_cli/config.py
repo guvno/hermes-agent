@@ -743,9 +743,10 @@ DEFAULT_CONFIG = {
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
     # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
-    # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS/Piper/MeloTTS 2000).
+    # Gemini/Google Cloud/Edge 5000, Mistral 4000,
+    # NeuTTS/KittenTTS/Piper/MeloTTS 2000).
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" | "kittentts" | "piper" | "melotts"
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "google_cloud" | "neutts" | "kittentts" | "piper" | "melotts"
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -774,6 +775,13 @@ DEFAULT_CONFIG = {
         "mistral": {
             "model": "voxtral-mini-tts-2603",
             "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
+        },
+        "google_cloud": {
+            "language_code": "ko-KR",
+            "voice": "ko-KR-Chirp3-HD-Kore",
+            "audio_encoding": "LINEAR16",  # Hermes converts WAV/LINEAR16 to Telegram OGG/Opus
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)

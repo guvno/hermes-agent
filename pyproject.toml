@@ -86,6 +86,8 @@ google = [
   "google-api-python-client>=2.100,<3",
   "google-auth-oauthlib>=1.0,<2",
   "google-auth-httplib2>=0.2,<1",
+  # Google Cloud Text-to-Speech (Chirp 3 HD) provider.
+  "google-cloud-texttospeech>=2.31.0,<3",
 ]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]

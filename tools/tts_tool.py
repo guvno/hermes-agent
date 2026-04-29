@@ -74,6 +74,12 @@ def _import_mistral_client():
     from mistralai.client import Mistral
     return Mistral
 
+
+def _import_google_cloud_tts():
+    """Lazy import Google Cloud Text-to-Speech client module."""
+    from google.cloud import texttospeech
+    return texttospeech
+
 def _import_sounddevice():
     """Lazy import sounddevice. Returns the module or raises ImportError/OSError."""
     import sounddevice as sd
@@ -115,6 +121,11 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GOOGLE_CLOUD_LANGUAGE_CODE = "ko-KR"
+DEFAULT_GOOGLE_CLOUD_VOICE = "ko-KR-Chirp3-HD-Kore"
+DEFAULT_GOOGLE_CLOUD_AUDIO_ENCODING = "LINEAR16"
+DEFAULT_GOOGLE_CLOUD_SPEAKING_RATE = 1.0
+DEFAULT_GOOGLE_CLOUD_PITCH = 0.0
 DEFAULT_PIPER_BASE_URL = "http://127.0.0.1:5005"
 DEFAULT_PIPER_TIMEOUT = 60
 DEFAULT_PIPER_HEALTH_TIMEOUT = 2
@@ -149,6 +160,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
     "gemini": 5000,       # Gemini TTS caps at ~8k input tokens / ~655s audio
+    "google_cloud": 5000, # Google Cloud TTS per-request practical cap; free tier is monthly
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
@@ -941,6 +953,57 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     return output_path
 
 
+
+# ===========================================================================
+# Provider: Google Cloud Text-to-Speech (Chirp 3 HD)
+# ===========================================================================
+def _generate_google_cloud_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using Google Cloud Text-to-Speech Chirp 3 HD voices.
+
+    Authentication uses Google Application Default Credentials, for example
+    ``GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json``.  The
+    provider writes Google Cloud's audio bytes directly; callers that need
+    Telegram voice bubbles request WAV first, then use Hermes' shared
+    postprocess/Opus conversion path.
+    """
+    gc_config = tts_config.get("google_cloud", {})
+    language_code = str(
+        gc_config.get("language_code", DEFAULT_GOOGLE_CLOUD_LANGUAGE_CODE)
+    ).strip() or DEFAULT_GOOGLE_CLOUD_LANGUAGE_CODE
+    voice = str(gc_config.get("voice", DEFAULT_GOOGLE_CLOUD_VOICE)).strip() or DEFAULT_GOOGLE_CLOUD_VOICE
+    encoding_name = str(
+        gc_config.get("audio_encoding", DEFAULT_GOOGLE_CLOUD_AUDIO_ENCODING)
+    ).strip().upper() or DEFAULT_GOOGLE_CLOUD_AUDIO_ENCODING
+    speaking_rate = float(gc_config.get("speaking_rate", tts_config.get("speed", DEFAULT_GOOGLE_CLOUD_SPEAKING_RATE)))
+    pitch = float(gc_config.get("pitch", DEFAULT_GOOGLE_CLOUD_PITCH))
+
+    texttospeech = _import_google_cloud_tts()
+    audio_encoding = getattr(texttospeech.AudioEncoding, encoding_name, None)
+    if audio_encoding is None:
+        raise ValueError(f"Unsupported Google Cloud TTS audio_encoding: {encoding_name}")
+
+    client = texttospeech.TextToSpeechClient()
+    request = {
+        "input": texttospeech.SynthesisInput(text=text),
+        "voice": texttospeech.VoiceSelectionParams(
+            language_code=language_code,
+            name=voice,
+        ),
+        "audio_config": texttospeech.AudioConfig(
+            audio_encoding=audio_encoding,
+            speaking_rate=max(0.25, min(4.0, speaking_rate)),
+            pitch=max(-20.0, min(20.0, pitch)),
+        ),
+    }
+    response = client.synthesize_speech(request=request)
+    audio_content = getattr(response, "audio_content", b"")
+    if not audio_content:
+        raise RuntimeError("Google Cloud TTS returned empty audio data")
+
+    with open(output_path, "wb") as f:
+        f.write(audio_content)
+    return output_path
+
 # ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
@@ -1369,6 +1432,17 @@ def text_to_speech_tool(
             logger.info("Generating speech with Google Gemini TTS...")
             _generate_gemini_tts(text, file_str, tts_config)
 
+        elif provider == "google_cloud":
+            logger.info("Generating speech with Google Cloud Text-to-Speech...")
+            google_output = file_str
+            # Google Cloud Chirp 3 HD can return LINEAR16/MP3, not Opus. For
+            # Telegram, synthesize WAV first, then postprocess and convert to
+            # OGG/Opus through the shared path below.
+            if file_str.endswith(".ogg"):
+                google_output = str(file_path.with_suffix(".wav"))
+            _generate_google_cloud_tts(text, google_output, tts_config)
+            file_str = google_output
+
         elif provider == "neutts":
             if not _check_neutts_available():
                 return json.dumps({
@@ -1464,7 +1538,7 @@ def text_to_speech_tool(
         # Edge TTS outputs MP3; NeuTTS/KittenTTS/Piper/MeloTTS output WAV; MiniMax/xAI
         # output MP3. All need ffmpeg conversion for Telegram voice bubbles.
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "piper", "melotts") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "piper", "melotts", "google_cloud") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -1544,6 +1618,12 @@ def check_tts_requirements() -> bool:
     try:
         _import_mistral_client()
         if os.getenv("MISTRAL_API_KEY"):
+            return True
+    except ImportError:
+        pass
+    try:
+        _import_google_cloud_tts()
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_CLOUD_PROJECT"):
             return True
     except ImportError:
         pass

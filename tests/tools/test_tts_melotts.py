@@ -18,6 +18,7 @@ def test_generate_melotts_invokes_external_python(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os.path, "exists", lambda path: path == "/home/ubuntu/melotts-venv/bin/python")
 
     output = tmp_path / "out.wav"
     result = _generate_melotts_tts(
@@ -59,6 +60,7 @@ def test_melotts_missing_output_raises(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os.path, "exists", lambda path: path == "/home/ubuntu/melotts-venv/bin/python")
 
     try:
         _generate_melotts_tts("안녕하세요", str(tmp_path / "missing.wav"), {"melotts": {}})
