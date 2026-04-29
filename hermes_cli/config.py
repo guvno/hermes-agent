@@ -766,6 +766,14 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "preset": "none",  # none, clean, hybrid, dark, cyber_autotune
         },
+        "visualizer": {
+            "enabled": False,
+            # Optional best-effort command run after each successful TTS output.
+            # Placeholders: {audio_path}, {audio_path_q}, {text}, {text_q}, {provider}
+            "command": [],
+            "timeout": 3,
+            "async": True,
+        },
         "xai": {
             "voice_id": "eve",
             "language": "en",

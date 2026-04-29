@@ -33,6 +33,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -453,6 +454,86 @@ def _apply_tts_postprocess(audio_path: str, tts_config: Dict[str, Any]) -> Optio
     if out.exists() and out.stat().st_size > 0:
         return str(out)
     return None
+
+
+def _format_visualizer_arg(value: Any, *, audio_path: str, text: str, provider: str) -> str:
+    """Format one configured visualizer command argument."""
+    return str(value).format(
+        audio_path=audio_path,
+        audio_path_q=shlex.quote(audio_path),
+        text=text,
+        text_q=shlex.quote(text),
+        provider=provider,
+    )
+
+
+def _notify_tts_visualizer(audio_path: str, text: str, provider: str, tts_config: Dict[str, Any]) -> bool:
+    """Notify an optional external TTS visualizer command.
+
+    Config shape::
+
+        tts:
+          visualizer:
+            enabled: true
+            command: ["python3", "~/.hermes/scripts/tts_visualizer_bridge.py", "--audio", "{audio_path}", "--text", "{text}"]
+            timeout: 3
+            async: true
+
+    The hook is best-effort: it never makes TTS generation fail.
+    """
+    visualizer_cfg = tts_config.get("visualizer", {}) if isinstance(tts_config.get("visualizer"), dict) else {}
+    if not visualizer_cfg.get("enabled", False):
+        return False
+
+    command = visualizer_cfg.get("command")
+    if not command:
+        logger.warning("TTS visualizer enabled but no command configured")
+        return False
+
+    try:
+        if isinstance(command, (list, tuple)):
+            argv = [
+                _format_visualizer_arg(part, audio_path=audio_path, text=text, provider=provider)
+                for part in command
+            ]
+        else:
+            formatted = _format_visualizer_arg(command, audio_path=audio_path, text=text, provider=provider)
+            argv = shlex.split(formatted)
+
+        if not argv:
+            return False
+
+        argv[0] = os.path.expanduser(argv[0])
+        env = os.environ.copy()
+        env.update({
+            "HERMES_TTS_AUDIO_PATH": audio_path,
+            "HERMES_TTS_TEXT": text,
+            "HERMES_TTS_PROVIDER": provider,
+        })
+        timeout = float(visualizer_cfg.get("timeout", 3))
+        run_async = bool(visualizer_cfg.get("async", True))
+        if run_async:
+            subprocess.Popen(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                env=env,
+            )
+        else:
+            subprocess.run(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        return True
+    except Exception as e:
+        logger.warning("TTS visualizer notification failed: %s", e, exc_info=True)
+        return False
 
 
 # ===========================================================================
@@ -1675,6 +1756,7 @@ def text_to_speech_tool(
             "provider": provider,
             "voice_compatible": voice_compatible,
         }
+        result["visualizer_notified"] = _notify_tts_visualizer(file_str, text, provider, tts_config)
         if fallback_from:
             result["fallback_from"] = fallback_from
             result["fallback_reason"] = fallback_reason or ""
