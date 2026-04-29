@@ -134,16 +134,17 @@ class TestTtsPostprocessPresets:
             assert "loudnorm" in filt
             assert "acrusher" in filt
 
-    def test_cyber_autotune_uses_jarvis_voice_chain_without_bitcrusher(self):
+    def test_cyber_autotune_uses_jarvis_voice_chain_without_bitcrusher_or_speedup(self):
         from tools.tts_tool import _tts_effect_filter
 
         filt = _tts_effect_filter("cyber_autotune")
         assert "asetrate=48000*1.05" in filt
+        assert "atempo=0.952" in filt  # compensates the pitch-style asetrate shift
         assert "flanger=delay=0:depth=2:regen=50:width=71:speed=0.5" in filt
         assert "aecho=0.8:0.88:15:0.5" in filt
         assert "highpass=f=200" in filt
         assert "treble=g=6" in filt
-        assert "atempo=1.25" in filt
+        assert "atempo=1.25" not in filt
         assert "loudnorm" in filt
         assert "acrusher" not in filt
 

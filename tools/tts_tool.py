@@ -320,6 +320,9 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
         # chain, adapted for Hermes/OpenAI's 48 kHz Opus path and Korean TTS.
         # Keep bitcrusher/acrusher out; the Jarvis-style character comes from
         # +5% asetrate pitch, strong flanger, short echo, highpass, and treble.
+        # The pitch compensation keeps the playback duration near the original;
+        # do not add a separate speed-up here because it makes Korean voice
+        # replies sound unnaturally rushed in Telegram.
         if not pitch:
             pitch = "asetrate=48000*1.05,aresample=48000,atempo=0.952,"
         body = (
@@ -327,7 +330,6 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
             "aecho=0.8:0.88:15:0.5,"
             "highpass=f=200,"
             "treble=g=6,"
-            "atempo=1.25,"
             "loudnorm=I=-16:TP=-1.5:LRA=6"
         )
     elif preset == "clean":
