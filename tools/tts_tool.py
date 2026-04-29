@@ -321,7 +321,9 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
         # Keep bitcrusher/acrusher out; the Jarvis-style character comes from
         # +5% asetrate pitch, strong flanger, short echo, highpass, and treble.
         # The pitch compensation keeps pitch-shift duration near the original;
-        # the final atempo=1.25 is the user-requested Telegram speaking speed.
+        # do not add a final speaking-speed boost here. Long replies already
+        # feel dense, and forcing a fixed atempo speedup makes them harder to
+        # understand in Telegram voice bubbles.
         if not pitch:
             pitch = "asetrate=48000*1.05,aresample=48000,atempo=0.952,"
         body = (
@@ -329,7 +331,6 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
             "aecho=0.8:0.88:15:0.5,"
             "highpass=f=200,"
             "treble=g=6,"
-            "atempo=1.25,"
             "loudnorm=I=-16:TP=-1.5:LRA=6"
         )
     elif preset == "clean":
@@ -1578,6 +1579,60 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _MD_HR.sub('', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
     return text.strip()
+
+
+def split_text_for_tts(text: str, max_chars: int = 1200, max_chunks: int = 3) -> list[str]:
+    """Split long auto-TTS text into natural chunks.
+
+    Messaging auto-TTS should not cram a long assistant reply into one voice
+    bubble. Some providers respond to dense, long inputs with rushed prosody,
+    and a single multi-minute Telegram voice note is hard to follow. Keep
+    chunks modest and sentence-aware; callers may cap ``max_chunks`` to avoid
+    spamming the chat.
+    """
+    cleaned = _strip_markdown_for_tts(text)
+    if not cleaned:
+        return []
+    max_chars = max(200, int(max_chars or 1200))
+    max_chunks = max(1, int(max_chunks or 1))
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    import re
+
+    sentences = re.split(r"(?<=[.!?。！？…]|[다요죠니다까네음함됨])\s+", cleaned)
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        while len(sentence) > max_chars:
+            cut = max(sentence.rfind(" ", 0, max_chars), sentence.rfind("\n", 0, max_chars))
+            if cut < max_chars // 2:
+                cut = max_chars
+            part, sentence = sentence[:cut].strip(), sentence[cut:].strip()
+            if current:
+                chunks.append(current)
+                current = ""
+            if part:
+                chunks.append(part)
+            if len(chunks) >= max_chunks:
+                return chunks[:max_chunks]
+        if not sentence:
+            continue
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+                if len(chunks) >= max_chunks:
+                    return chunks[:max_chunks]
+            current = sentence
+    if current and len(chunks) < max_chunks:
+        chunks.append(current)
+    return chunks[:max_chunks]
 
 
 def stream_tts_to_speaker(

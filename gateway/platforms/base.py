@@ -2438,33 +2438,51 @@ class BasePlatformAdapter(ABC):
                         and text_content
                         and not media_files):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        from tools.tts_tool import check_tts_requirements, split_text_for_tts, text_to_speech_tool
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
-                            if not speech_text:
-                                raise ValueError("Empty text after markdown cleanup")
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                            from hermes_cli.config import load_config as _load_full_config
+                            tts_cfg = (_load_full_config().get("tts") or {})
+                            max_chunk_chars = int(os.getenv("HERMES_AUTO_TTS_CHUNK_CHARS", tts_cfg.get("auto_chunk_chars", 1200)))
+                            max_chunks = int(os.getenv("HERMES_AUTO_TTS_MAX_CHUNKS", tts_cfg.get("auto_max_chunks", 3)))
+                            speech_chunks = split_text_for_tts(
+                                text_content[:4000],
+                                max_chars=max_chunk_chars,
+                                max_chunks=max_chunks,
                             )
-                            tts_data = _json.loads(tts_result_str)
-                            _tts_path = tts_data.get("file_path")
+                            if not speech_chunks:
+                                raise ValueError("Empty text after markdown cleanup")
+                            _tts_path = []
+                            for speech_text in speech_chunks:
+                                if not speech_text:
+                                    continue
+                                tts_result_str = await asyncio.to_thread(
+                                    text_to_speech_tool, text=speech_text
+                                )
+                                tts_data = _json.loads(tts_result_str)
+                                path = tts_data.get("file_path")
+                                if path:
+                                    _tts_path.append(path)
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
                 # Play TTS audio before text (voice-first experience)
-                if _tts_path and Path(_tts_path).exists():
-                    try:
-                        await self.play_tts(
-                            chat_id=event.source.chat_id,
-                            audio_path=_tts_path,
-                            metadata=_thread_metadata,
-                        )
-                    finally:
+                if _tts_path:
+                    paths = _tts_path if isinstance(_tts_path, list) else [_tts_path]
+                    for tts_path in paths:
+                        if not (tts_path and Path(tts_path).exists()):
+                            continue
                         try:
-                            os.remove(_tts_path)
-                        except OSError:
-                            pass
+                            await self.play_tts(
+                                chat_id=event.source.chat_id,
+                                audio_path=tts_path,
+                                metadata=_thread_metadata,
+                            )
+                        finally:
+                            try:
+                                os.remove(tts_path)
+                            except OSError:
+                                pass
 
                 # Send the text portion
                 if text_content:
