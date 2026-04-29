@@ -37,6 +37,17 @@ HEADER_H = 31
 
 DEFAULT_BASE = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "HermesTTSVisualizer"
 SETTINGS_PATH = DEFAULT_BASE / "visualizer_settings.json"
+LOG_PATH = DEFAULT_BASE / "listener.log"
+
+
+def log(message: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
 
 
 def decode_with_ffmpeg(path: Path) -> list[int]:
@@ -120,7 +131,7 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 class Visualizer:
-    def __init__(self, audio: Path, text: str, provider: str):
+    def __init__(self, audio: Path, text: str, provider: str, play_audio: bool = True):
         self.audio = audio
         self.text = " ".join((text or audio.name).replace("\n", " ").split())
         self.provider = provider
@@ -128,6 +139,11 @@ class Visualizer:
         self.duration = 2.0
         self.index = 0
         self.started_at = time.monotonic()
+        self.loaded = False
+        self.load_started_at = time.monotonic()
+        self.play_audio = play_audio
+        self.play_started = False
+        self.audio_proc: subprocess.Popen | None = None
         self.minimized = False
         self.drag_offset: tuple[int, int] | None = None
         self.settings = load_settings()
@@ -167,6 +183,59 @@ class Visualizer:
 
     def _load(self) -> None:
         self.frames, self.duration = load_envelope(self.audio)
+        self.loaded = True
+
+    def _find_ffplay(self) -> str | None:
+        ffplay = shutil.which("ffplay")
+        if ffplay:
+            return ffplay
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            candidate = Path(ffmpeg).with_name("ffplay.exe" if sys.platform.startswith("win") else "ffplay")
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _start_playback(self) -> None:
+        if self.play_started or not self.play_audio:
+            return
+        self.play_started = True
+        ffplay = self._find_ffplay()
+        if not ffplay:
+            log(f"audio playback skipped for {self.audio.name}: ffplay not found")
+            return
+        cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", str(self.audio)]
+        try:
+            creationflags = 0
+            if sys.platform.startswith("win") and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                creationflags = subprocess.CREATE_NO_WINDOW
+            self.audio_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            log(f"started desktop audio playback for {self.audio.name} pid={self.audio_proc.pid}")
+        except Exception as exc:
+            log(f"audio playback failed for {self.audio.name}: {exc!r}")
+            self.audio_proc = None
+
+    def _stop_playback(self) -> None:
+        proc = self.audio_proc
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    def _close_window(self) -> None:
+        self._stop_playback()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _set_alpha(self, alpha: float) -> None:
         try:
@@ -257,7 +326,7 @@ class Visualizer:
             alpha = self.alpha_target
         next_alpha = alpha - max(0.03, self.alpha_target / (FADE_OUT_SECONDS * FPS))
         if next_alpha <= 0.02:
-            self.root.destroy()
+            self._close_window()
             return
         self._set_alpha(next_alpha)
         self.root.after(int(1000 / FPS), self._fade_out_step)
@@ -321,11 +390,23 @@ class Visualizer:
         label = "HERMES TTS  ▣" if self.topmost else "HERMES TTS  □"
         self.canvas.create_text(31, 17, anchor="w", text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
 
+    def _wait_then_start(self) -> None:
+        # Keep playback and bars aligned: wait briefly for ffmpeg decoding before
+        # starting ffplay. If decoding is slow or unavailable, start anyway rather
+        # than leaving a polite but useless dark rectangle.
+        if not self.loaded and time.monotonic() - self.load_started_at < 2.0:
+            self.root.after(50, self._wait_then_start)
+            return
+        self.started_at = time.monotonic()
+        self.index = 0
+        self._start_playback()
+        self.draw()
+
     def draw(self) -> None:
         elapsed = time.monotonic() - self.started_at
         total_life = max(self.duration, len(self.frames) / FPS) + HOLD_SECONDS + FADE_OUT_SECONDS
         if not self._apply_timed_alpha(elapsed, total_life):
-            self.root.destroy()
+            self._close_window()
             return
         if self.minimized:
             self._draw_minimized()
@@ -353,10 +434,10 @@ class Visualizer:
         if elapsed <= total_life:
             self.root.after(int(1000 / FPS), self.draw)
         else:
-            self.root.destroy()
+            self._close_window()
 
     def run(self) -> None:
-        self.root.after(40, self.draw)
+        self.root.after(40, self._wait_then_start)
         self.root.mainloop()
 
 
@@ -365,11 +446,13 @@ def main() -> int:
     parser.add_argument("--audio", required=True)
     parser.add_argument("--text", default="")
     parser.add_argument("--provider", default="")
+    parser.add_argument("--play", dest="play_audio", action="store_true", default=True, help="Play the same audio on this Windows desktop while visualizing")
+    parser.add_argument("--no-play", dest="play_audio", action="store_false", help="Visualize only; do not play audio on this Windows desktop")
     args = parser.parse_args()
     audio = Path(args.audio)
     if not audio.exists():
         return 2
-    Visualizer(audio, args.text, args.provider).run()
+    Visualizer(audio, args.text, args.provider, play_audio=args.play_audio).run()
     return 0
 
 
