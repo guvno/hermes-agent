@@ -137,6 +137,57 @@ def test_text_to_speech_dispatches_google_cloud_to_wav_then_telegram_opus(monkey
     assert generated["convert_input"].endswith("out_cyber_autotune.wav")
 
 
+def test_text_to_speech_falls_back_to_edge_when_google_cloud_monthly_quota_exhausted(monkeypatch, tmp_path):
+    from tools import tts_tool as _tt
+
+    requested_ogg = tmp_path / "quota_fallback.ogg"
+    generated = {}
+
+    def fake_google_cloud(text, output_path, config):
+        generated["google_cloud_called"] = True
+        raise ValueError("Google Cloud TTS monthly character limit would be exceeded: used 999,999/1,000,000")
+
+    async def fake_edge(text, output_path, config):
+        generated["edge_output_path"] = output_path
+        assert output_path.endswith(".mp3")
+        with open(output_path, "wb") as f:
+            f.write(b"fake edge mp3")
+        return output_path
+
+    def fake_convert(path):
+        generated["convert_input"] = path
+        opus = tmp_path / "quota_fallback.ogg"
+        opus.write_bytes(b"OggS opus")
+        return str(opus)
+
+    monkeypatch.setattr(
+        _tt,
+        "_load_tts_config",
+        lambda: {
+            "provider": "google_cloud",
+            "google_cloud": {"fallback_provider": "edge"},
+            "edge": {"voice": "ko-KR-SunHiNeural"},
+            "postprocess": {"enabled": False, "preset": "none"},
+        },
+    )
+    monkeypatch.setattr(_tt, "_generate_google_cloud_tts", fake_google_cloud)
+    monkeypatch.setattr(_tt, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(_tt, "_generate_edge_tts", fake_edge)
+    monkeypatch.setattr(_tt, "_convert_to_opus", fake_convert)
+
+    result = json.loads(_tt.text_to_speech_tool("안녕하세요", str(requested_ogg)))
+
+    assert result["success"] is True
+    assert result["provider"] == "edge"
+    assert result["fallback_from"] == "google_cloud"
+    assert "monthly character limit" in result["fallback_reason"]
+    assert result["file_path"].endswith("quota_fallback.ogg")
+    assert result["voice_compatible"] is True
+    assert generated["google_cloud_called"] is True
+    assert generated["edge_output_path"].endswith("quota_fallback.mp3")
+    assert generated["convert_input"] == generated["edge_output_path"]
+
+
 def test_google_cloud_has_default_text_limit():
     from tools.tts_tool import PROVIDER_MAX_TEXT_LENGTH, _resolve_max_text_length
 

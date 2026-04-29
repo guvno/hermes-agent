@@ -783,6 +783,7 @@ DEFAULT_CONFIG = {
             "speaking_rate": 1.0,
             "pitch": 0.0,
             "monthly_character_limit": 1000000,  # Stay within Google Cloud TTS monthly free tier
+            "fallback_provider": "edge",  # Used when the monthly character limit is exhausted
             "usage_path": "",  # Empty = ~/.hermes/state/tts/google_cloud_usage.json
         },
         "neutts": {

@@ -1469,6 +1469,9 @@ def text_to_speech_tool(
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
 
+    fallback_from = None
+    fallback_reason = None
+
     try:
         # Generate audio with the configured provider
         if provider == "elevenlabs":
@@ -1525,8 +1528,34 @@ def text_to_speech_tool(
             # OGG/Opus through the shared path below.
             if file_str.endswith(".ogg"):
                 google_output = str(file_path.with_suffix(".wav"))
-            _generate_google_cloud_tts(text, google_output, tts_config)
-            file_str = google_output
+            try:
+                _generate_google_cloud_tts(text, google_output, tts_config)
+                file_str = google_output
+            except ValueError as e:
+                gc_config = tts_config.get("google_cloud", {}) if isinstance(tts_config.get("google_cloud"), dict) else {}
+                fallback_provider = str(gc_config.get("fallback_provider", "edge")).strip().lower()
+                if "monthly character limit" not in str(e) or fallback_provider != "edge":
+                    raise
+                logger.warning("Google Cloud TTS quota exhausted; falling back to Edge TTS: %s", e)
+                try:
+                    _import_edge_tts()
+                except ImportError as import_error:
+                    raise FileNotFoundError("Edge TTS fallback requested but 'edge_tts' package is not installed") from import_error
+                fallback_from = "google_cloud"
+                fallback_reason = str(e)
+                provider = "edge"
+                edge_output = str(file_path)
+                if edge_output.endswith(".ogg"):
+                    edge_output = str(Path(edge_output).with_suffix(".mp3"))
+                try:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(
+                            lambda: asyncio.run(_generate_edge_tts(text, edge_output, tts_config))
+                        ).result(timeout=60)
+                except RuntimeError:
+                    asyncio.run(_generate_edge_tts(text, edge_output, tts_config))
+                file_str = edge_output
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -1639,13 +1668,17 @@ def text_to_speech_tool(
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
 
-        return json.dumps({
+        result = {
             "success": True,
             "file_path": file_str,
             "media_tag": media_tag,
             "provider": provider,
             "voice_compatible": voice_compatible,
-        }, ensure_ascii=False)
+        }
+        if fallback_from:
+            result["fallback_from"] = fallback_from
+            result["fallback_reason"] = fallback_reason or ""
+        return json.dumps(result, ensure_ascii=False)
 
     except ValueError as e:
         # Configuration errors (missing API keys, etc.)
