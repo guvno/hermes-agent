@@ -93,7 +93,9 @@ def handle_meta(meta: Path, python_exe: str, visualizer_script: Path) -> bool:
     if not stable(audio):
         log(f"audio not stable yet: {audio}")
         return False
-    text = str(payload.get("text") or "")[:220]
+    # Keep enough text for the visualizer's marquee. It scrolls/clips its own
+    # header, so the listener should not pre-truncate normal TTS replies.
+    text = str(payload.get("text") or "")[:2000]
     provider = str(payload.get("provider") or "")[:80]
     return launch_visualizer(python_exe, visualizer_script, audio, text=text, provider=provider)
 
