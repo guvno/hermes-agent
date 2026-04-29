@@ -391,7 +391,7 @@ class Visualizer:
         self.canvas.create_text(31, 17, anchor="w", text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
 
     def _wait_then_start(self) -> None:
-        # Keep playback and bars aligned: wait briefly for ffmpeg decoding before
+        # Keep playback and motion aligned: wait briefly for ffmpeg decoding before
         # starting ffplay. If decoding is slow or unavailable, start anyway rather
         # than leaving a polite but useless dark rectangle.
         if not self.loaded and time.monotonic() - self.load_started_at < 2.0:
@@ -401,6 +401,99 @@ class Visualizer:
         self.index = 0
         self._start_playback()
         self.draw()
+
+    def _blend_hex(self, a: str, b: str, t: float) -> str:
+        t = max(0.0, min(1.0, t))
+        ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+        br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+        return f"#{int(ar + (br - ar) * t):02x}{int(ag + (bg - ag) * t):02x}{int(ab + (bb - ab) * t):02x}"
+
+    def _draw_radial_visualizer(self, frame: list[float], elapsed: float, progress: float) -> None:
+        # A tiny Processing-style sketch implemented directly on Tk Canvas:
+        # polar samples, orbital phase, translucent-looking layers, and no
+        # external dependency. Processing itself is marvellous, but requiring it
+        # for a corner HUD would be a rather theatrical way to draw a circle.
+        cx = WINDOW_W / 2
+        cy = HEADER_H + (WINDOW_H - HEADER_H) / 2 + 5
+        pulse = sum(frame) / max(1, len(frame))
+        beat = min(1.0, pulse * 1.8)
+        spin = elapsed * 0.92
+        inner_r = 19 + beat * 6
+        base_r = 42 + beat * 13
+        outer_r = 54 + beat * 23
+
+        # Soft neon halo, faked with concentric outlines because Tk has the
+        # alpha support of a Victorian gas lamp.
+        for layer in range(7, 0, -1):
+            r = outer_r + layer * 5 + math.sin(elapsed * 1.7 + layer) * 1.8
+            color = self._blend_hex("#05070d", "#155e75", layer / 9)
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, width=1)
+
+        # Outer organic waveform: closed polar spline-ish polyline.
+        points: list[float] = []
+        n = len(frame)
+        for i, amp in enumerate(frame):
+            theta = (math.tau * i / n) - math.pi / 2 + spin * 0.18
+            eased = amp ** 0.55
+            wobble = math.sin(theta * 3.0 + elapsed * 2.2) * 4.5 + math.sin(theta * 7.0 - elapsed * 1.4) * 2.4
+            r = base_r + eased * 49 + wobble
+            points.extend([cx + math.cos(theta) * r, cy + math.sin(theta) * r])
+        if len(points) >= 6:
+            self.canvas.create_polygon(points, fill="", outline="#22d3ee", width=2, smooth=True)
+
+        # Counter-rotating violet trace for that pleasantly ominous lab-instrument look.
+        trace: list[float] = []
+        for i, amp in enumerate(reversed(frame)):
+            theta = (math.tau * i / n) - math.pi / 2 - spin * 0.12
+            eased = amp ** 0.65
+            r = inner_r + eased * 38 + math.sin(theta * 5.0 + elapsed) * 3
+            trace.extend([cx + math.cos(theta) * r, cy + math.sin(theta) * r])
+        if len(trace) >= 6:
+            self.canvas.create_polygon(trace, fill="", outline="#a78bfa", width=1, smooth=True)
+
+        # Radial shards: not bars, more like a small cybernetic sea urchin.
+        for i in range(0, n, 2):
+            amp = frame[i]
+            eased = amp ** 0.5
+            theta = (math.tau * i / n) - math.pi / 2 + spin * 0.24
+            r0 = inner_r + eased * 9
+            r1 = base_r + 12 + eased * 54
+            color = self._blend_hex("#38bdf8", "#c084fc", (math.sin(theta + elapsed) + 1) / 2)
+            self.canvas.create_line(
+                cx + math.cos(theta) * r0,
+                cy + math.sin(theta) * r0,
+                cx + math.cos(theta) * r1,
+                cy + math.sin(theta) * r1,
+                fill=color,
+                width=max(1, int(1 + eased * 3)),
+            )
+
+        # Orbiting particles driven by local amplitude.
+        for i in range(12):
+            amp = frame[(i * 4 + self.index) % n]
+            theta = math.tau * i / 12 + spin * (0.45 + (i % 3) * 0.07)
+            r = outer_r + 12 + math.sin(elapsed * 2 + i) * 8 + amp * 23
+            size = 2.0 + amp * 5.0
+            px = cx + math.cos(theta) * r
+            py = cy + math.sin(theta) * r
+            self.canvas.create_oval(px - size, py - size, px + size, py + size, fill="#67e8f9", outline="")
+
+        # Core and circular progress ring.
+        core_r = inner_r + beat * 5
+        self.canvas.create_oval(cx - core_r, cy - core_r, cx + core_r, cy + core_r, fill="#07111f", outline="#67e8f9", width=2)
+        self.canvas.create_text(cx, cy, text="◌", fill="#e0f2fe", font=("Segoe UI Symbol", 20, "bold"))
+        ring_r = outer_r + 28
+        self.canvas.create_arc(
+            cx - ring_r,
+            cy - ring_r,
+            cx + ring_r,
+            cy + ring_r,
+            start=90,
+            extent=-359.5 * progress,
+            style="arc",
+            outline="#38bdf8",
+            width=3,
+        )
 
     def draw(self) -> None:
         elapsed = time.monotonic() - self.started_at
@@ -417,19 +510,8 @@ class Visualizer:
         self.canvas.create_rectangle(0, 0, WINDOW_W, WINDOW_H, fill="#05070d", outline="#152033")
         self._draw_header()
         frame = self.frames[min(self.index, len(self.frames) - 1)]
-        usable_w = WINDOW_W - MARGIN * 2
-        bar_w = usable_w / BAR_COUNT
-        base_y = WINDOW_H - 25
-        for i, amp in enumerate(frame):
-            eased = min(1.0, amp ** 0.55)
-            h = 7 + eased * 82
-            x0 = MARGIN + i * bar_w + 1
-            x1 = MARGIN + (i + 1) * bar_w - 1
-            y0 = base_y - h
-            color = "#22d3ee" if i % 3 else "#a78bfa"
-            self.canvas.create_rectangle(x0, y0, x1, base_y, fill=color, outline="")
         progress = min(1.0, self.index / max(1, len(self.frames)))
-        self.canvas.create_rectangle(MARGIN, WINDOW_H - 11, MARGIN + usable_w * progress, WINDOW_H - 8, fill="#38bdf8", outline="")
+        self._draw_radial_visualizer(frame, elapsed, progress)
         self.index += 1
         if elapsed <= total_life:
             self.root.after(int(1000 / FPS), self.draw)
