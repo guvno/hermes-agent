@@ -9,10 +9,11 @@ visualizer window for that audio.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import shlex
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -35,8 +36,6 @@ def main() -> int:
     parser.add_argument("--user", default=os.environ.get("MAINPC_SSH_USER", "home"))
     parser.add_argument("--key", default=os.environ.get("MAINPC_SSH_KEY", "/home/ubuntu/.ssh/reverse_to_windows"))
     parser.add_argument("--remote-dir", default="C:/Users/home/AppData/Local/HermesTTSVisualizer")
-    parser.add_argument("--remote-script", default="C:/Users/home/AppData/Local/HermesTTSVisualizer/tts_visualizer_win.py")
-    parser.add_argument("--python", default="python")
     parser.add_argument("--timeout", type=float, default=10)
     args = parser.parse_args()
 
@@ -72,18 +71,27 @@ def main() -> int:
         return copied.returncode or 4
 
     text = args.text[:220]
-    ps = (
-        "$p = Start-Process -WindowStyle Hidden -PassThru "
-        f"-FilePath {ps_quote(args.python)} "
-        f"-ArgumentList @({ps_quote(args.remote_script)}, '--audio', {ps_quote(remote_audio)}, '--text', {ps_quote(text)}, '--provider', {ps_quote(args.provider)})"
-    )
-    launched = run(
-        ssh_base + [f"powershell -NoProfile -ExecutionPolicy Bypass -Command {shlex.quote(ps)}"],
-        timeout=args.timeout,
-    )
-    if launched.returncode != 0:
-        print(launched.stderr or launched.stdout, file=sys.stderr)
-        return launched.returncode or 5
+    meta_name = f"{Path(dest_name).stem}.json"
+    meta_payload = {
+        "audio": remote_audio,
+        "text": text,
+        "provider": args.provider,
+        "source": str(audio),
+        "created_at": uuid.uuid4().hex,
+    }
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as fh:
+        json.dump(meta_payload, fh, ensure_ascii=False, indent=2)
+        local_meta = Path(fh.name)
+    try:
+        copied_meta = run(scp_base + [str(local_meta), f"{target}:{remote_inbox}/{meta_name}"], timeout=max(args.timeout, 20))
+    finally:
+        try:
+            local_meta.unlink()
+        except OSError:
+            pass
+    if copied_meta.returncode != 0:
+        print(copied_meta.stderr or copied_meta.stdout, file=sys.stderr)
+        return copied_meta.returncode or 5
     return 0
 
 
