@@ -296,7 +296,7 @@ def _ffmpeg_has_filter(filter_name: str) -> bool:
     return result.returncode == 0 and re.search(rf"\s{re.escape(filter_name)}\s", result.stdout) is not None
 
 
-def _tts_effect_filter(preset: str) -> Optional[str]:
+def _tts_effect_filter(preset: str, sample_rate: Optional[int] = None) -> Optional[str]:
     """Build a conservative ffmpeg filter chain for lab-AI TTS effects."""
     preset = (preset or "none").lower().strip()
     if preset in ("", "none", "off", "false"):
@@ -325,7 +325,10 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
         # feel dense, and forcing a fixed atempo speedup makes them harder to
         # understand in Telegram voice bubbles.
         if not pitch:
-            pitch = "asetrate=48000*1.05,aresample=48000,atempo=0.952,"
+            # Match the input stream's sample rate. Hard-coding 48000 here made
+            # 24 kHz Edge TTS output play about 2x too fast after resampling.
+            pitch_rate = int(sample_rate or 48000)
+            pitch = f"asetrate={pitch_rate}*1.05,aresample={pitch_rate},atempo=0.952,"
         body = (
             "flanger=delay=0:depth=2:regen=50:width=71:speed=0.5,"
             "aecho=0.8:0.88:15:0.5,"
@@ -372,6 +375,32 @@ def _tts_effect_filter(preset: str) -> Optional[str]:
     return f"{pitch}{body}"
 
 
+def _audio_sample_rate(audio_path: str) -> Optional[int]:
+    """Return the first audio stream sample rate using ffprobe, if available."""
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        value = int((result.stdout or "").strip().splitlines()[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _apply_tts_postprocess(audio_path: str, tts_config: Dict[str, Any]) -> Optional[str]:
     """Apply optional ffmpeg postprocessing before the file is delivered."""
     post_cfg = tts_config.get("postprocess", {})
@@ -385,7 +414,8 @@ def _apply_tts_postprocess(audio_path: str, tts_config: Dict[str, Any]) -> Optio
         logger.warning("TTS postprocess requested but ffmpeg is not available")
         return None
 
-    filter_chain = _tts_effect_filter(preset)
+    sample_rate = _audio_sample_rate(audio_path)
+    filter_chain = _tts_effect_filter(preset, sample_rate=sample_rate)
     if not filter_chain:
         return None
 
