@@ -273,6 +273,80 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    def _delivery_for_chat_id(self, chat_id: str, *, purpose: str = "delivery") -> Dict[str, Any]:
+        """Return stored or route-recovered delivery config for a webhook chat."""
+        delivery = self._delivery_info.get(chat_id, {})
+        if not delivery and chat_id.startswith("webhook:"):
+            try:
+                route_name = chat_id.split(":", 2)[1]
+                route_config = self._routes.get(route_name) or {}
+                if route_config:
+                    delivery = {
+                        "deliver": route_config.get("deliver", "log"),
+                        "deliver_extra": route_config.get("deliver_extra", {}),
+                        "payload": {},
+                    }
+                    logger.info(
+                        "[webhook] Recovered %s config for %s from route %s",
+                        purpose,
+                        chat_id,
+                        route_name,
+                    )
+            except Exception:
+                logger.debug("[webhook] Could not recover %s config for %s", purpose, chat_id, exc_info=True)
+        return delivery
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Forward typing indicators to the configured delivery target.
+
+        Webhook-originated agent runs execute under the synthetic webhook
+        adapter, so BasePlatformAdapter's keep-typing loop naturally calls
+        ``WebhookAdapter.send_typing``.  For routes that ultimately deliver to
+        Telegram/Discord/etc., forward that indicator to the real target chat
+        so voice-sphere and other webhook bridges show the same "typing..." UI
+        as native platform messages.
+        """
+        delivery = self._delivery_for_chat_id(chat_id, purpose="typing delivery")
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type in ("log", "github_comment"):
+            return
+        if not self.gateway_runner:
+            return
+
+        try:
+            target_platform = Platform(deliver_type)
+        except ValueError:
+            return
+
+        adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter or not hasattr(adapter, "send_typing"):
+            return
+
+        extra = delivery.get("deliver_extra", {}) or {}
+        target_chat_id = extra.get("chat_id", "")
+        if not target_chat_id:
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if not home:
+                return
+            target_chat_id = home.chat_id
+
+        target_metadata: Dict[str, Any] = {}
+        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if thread_id:
+            target_metadata["thread_id"] = thread_id
+        if metadata:
+            target_metadata.update(metadata)
+
+        try:
+            await adapter.send_typing(str(target_chat_id), metadata=target_metadata or None)
+        except Exception:
+            logger.debug(
+                "[webhook] Failed to forward typing indicator to %s:%s",
+                deliver_type,
+                target_chat_id,
+                exc_info=True,
+            )
+
     async def send_exec_approval(
         self,
         chat_id: str,

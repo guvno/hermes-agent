@@ -761,6 +761,50 @@ class TestDeliverCrossPlatformThreadId:
         )
 
     @pytest.mark.asyncio
+    async def test_send_typing_forwarded_to_delivery_target(self):
+        """Webhook typing indicators are forwarded to the configured platform chat."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_typing = AsyncMock()
+        chat_id = "webhook:voice-sphere:req-1"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "telegram",
+            "deliver_extra": {
+                "chat_id": "12345",
+                "thread_id": "999",
+            },
+        }
+
+        await adapter.send_typing(chat_id)
+
+        mock_target.send_typing.assert_awaited_once_with(
+            "12345", metadata={"thread_id": "999"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_typing_recovers_delivery_from_route_config(self):
+        """Typing forwarding still works if in-memory delivery_info is missing."""
+        routes = {
+            "voice-sphere": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_extra": {"chat_id": "12345", "message_thread_id": "888"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        mock_target = AsyncMock()
+        mock_target.send_typing = AsyncMock()
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("telegram"): mock_target}
+        mock_runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = mock_runner
+
+        await adapter.send_typing("webhook:voice-sphere:req-2")
+
+        mock_target.send_typing.assert_awaited_once_with(
+            "12345", metadata={"thread_id": "888"}
+        )
+
+    @pytest.mark.asyncio
     async def test_voice_reply_sends_tts_before_text(self, tmp_path):
         """voice_reply=true generates TTS and sends it before the text response."""
         adapter, mock_target = self._setup_adapter_with_mock_target()
