@@ -193,6 +193,28 @@ class WebhookAdapter(BasePlatformAdapter):
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
         delivery = self._delivery_info.get(chat_id, {})
+        if not delivery and chat_id.startswith("webhook:"):
+            # Defensive fallback for long-running / restarted webhook sessions.
+            # The normal path stores delivery info during _handle_webhook(), but
+            # if that in-memory map is missing we can still recover the route
+            # configuration from chat_id = webhook:{route}:{delivery_id}.
+            try:
+                route_name = chat_id.split(":", 2)[1]
+                route_config = self._routes.get(route_name) or {}
+                if route_config:
+                    delivery = {
+                        "deliver": route_config.get("deliver", "log"),
+                        "deliver_extra": route_config.get("deliver_extra", {}),
+                        "payload": {},
+                    }
+                    logger.info(
+                        "[webhook] Recovered delivery config for %s from route %s",
+                        chat_id,
+                        route_name,
+                    )
+            except Exception:
+                logger.debug("[webhook] Could not recover delivery config for %s", chat_id, exc_info=True)
+
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
