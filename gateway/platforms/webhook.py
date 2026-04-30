@@ -273,6 +273,84 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Forward interactive command-approval prompts to the delivery target.
+
+        Agent-mode webhooks run under a ``webhook:{route}:{delivery}`` session
+        key, but many routes deliver their responses to a rich chat platform
+        like Telegram or Discord.  Without this bridge, gateway approvals fall
+        back to plain text via ``send()``, so the user sees instructions like
+        ``/approve`` in Telegram while the pending approval actually belongs to
+        the webhook session key.  Telegram then quite correctly says "No pending
+        command" — a tiny distributed-systems comedy with one actor missing.
+
+        If the route's delivery adapter supports button-based approvals, pass
+        through the original webhook ``session_key`` so its callback resolves
+        the blocked webhook agent thread directly.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        if not delivery and chat_id.startswith("webhook:"):
+            try:
+                route_name = chat_id.split(":", 2)[1]
+                route_config = self._routes.get(route_name) or {}
+                if route_config:
+                    delivery = {
+                        "deliver": route_config.get("deliver", "log"),
+                        "deliver_extra": route_config.get("deliver_extra", {}),
+                        "payload": {},
+                    }
+            except Exception:
+                logger.debug("[webhook] Could not recover approval delivery config for %s", chat_id, exc_info=True)
+
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type in ("log", "github_comment"):
+            return SendResult(success=False, error=f"Approval buttons unsupported for deliver={deliver_type}")
+
+        if not self.gateway_runner:
+            return SendResult(success=False, error="No gateway runner for cross-platform approval delivery")
+
+        try:
+            target_platform = Platform(deliver_type)
+        except ValueError:
+            return SendResult(success=False, error=f"Unknown platform: {deliver_type}")
+
+        adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter:
+            return SendResult(success=False, error=f"Platform {deliver_type} not connected")
+        if getattr(type(adapter), "send_exec_approval", None) is None:
+            return SendResult(success=False, error=f"Platform {deliver_type} does not support approval buttons")
+
+        extra = delivery.get("deliver_extra", {}) or {}
+        target_chat_id = extra.get("chat_id", "")
+        if not target_chat_id:
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if home:
+                target_chat_id = home.chat_id
+            else:
+                return SendResult(success=False, error=f"No chat_id or home channel for {deliver_type}")
+
+        target_metadata: Dict[str, Any] = {}
+        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if thread_id:
+            target_metadata["thread_id"] = thread_id
+        if metadata:
+            target_metadata.update(metadata)
+
+        return await adapter.send_exec_approval(
+            chat_id=str(target_chat_id),
+            command=command,
+            session_key=session_key,
+            description=description,
+            metadata=target_metadata or None,
+        )
+
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
