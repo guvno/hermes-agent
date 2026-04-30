@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Always-on-top corner visualizer for Hermes TTS audio on Windows.
+"""Circular Hermes TTS audio visualizer for Windows.
 
-No third-party Python packages are required. ffmpeg is used when available so
-Telegram-friendly OGG/Opus files work; WAV files fall back to the stdlib wave
-module.
+Resident listener launches this script in the interactive desktop session.
+No third-party Python packages are required. ffmpeg/ffplay are used when present
+for OGG/Opus decoding and desktop playback.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
+import random
 import shutil
 import struct
 import subprocess
 import sys
 import threading
+import traceback
 import time
 import wave
 from pathlib import Path
@@ -23,21 +26,24 @@ from tkinter import BOTH, Canvas, Tk
 
 SAMPLE_RATE = 48_000
 FPS = 30
-BAR_COUNT = 48
-WINDOW_W = 460
-WINDOW_H = 150
+BAR_COUNT = 128
+WINDOW_W = 520
+WINDOW_H = 520
 MINI_W = 168
 MINI_H = 34
-MARGIN = 16
+MARGIN = 18
 TARGET_ALPHA = 0.92
 FADE_IN_SECONDS = 0.35
 FADE_OUT_SECONDS = 0.65
+VISUAL_FADE_IN_SECONDS = 0.85
+VISUAL_FADE_OUT_SECONDS = 0.95
 HOLD_SECONDS = 1.4
-HEADER_H = 31
+HEADER_H = 34
 
 DEFAULT_BASE = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "HermesTTSVisualizer"
 SETTINGS_PATH = DEFAULT_BASE / "visualizer_settings.json"
 LOG_PATH = DEFAULT_BASE / "listener.log"
+PROCESS_SUSPEND_RESUME = 0x0800
 
 
 def log(message: str) -> None:
@@ -85,13 +91,14 @@ def load_envelope(path: Path) -> tuple[list[list[float]], float]:
     if not samples and path.suffix.lower() == ".wav":
         samples, sample_rate = decode_wave(path)
     if not samples:
-        # A graceful failure still gives the user a visible pulse rather than a
-        # dead square in the corner. Technology must at least look guilty.
-        frames = [[0.15 + 0.1 * math.sin(i / 3 + b / 4) for b in range(BAR_COUNT)] for i in range(FPS * 3)]
+        frames = []
+        for i in range(FPS * 3):
+            frames.append([0.18 + 0.12 * math.sin(i / 3 + b / 5) for b in range(BAR_COUNT)])
         return frames, 3.0
 
     samples_per_frame = max(1, int(sample_rate / FPS))
     frames: list[list[float]] = []
+    prev = [0.0] * BAR_COUNT
     for start in range(0, len(samples), samples_per_frame):
         chunk = samples[start : start + samples_per_frame]
         if not chunk:
@@ -101,10 +108,13 @@ def load_envelope(path: Path) -> tuple[list[list[float]], float]:
         for b in range(BAR_COUNT):
             band = chunk[b * band_size : (b + 1) * band_size]
             if not band:
-                bars.append(0.0)
+                bars.append(prev[b] * 0.84)
                 continue
             rms = math.sqrt(sum(x * x for x in band) / len(band)) / 32768.0
-            bars.append(min(1.0, rms * 4.8))
+            value = min(1.0, rms * 5.4)
+            # Smooth enough to feel deliberate, not like a nervous ECG.
+            bars.append(prev[b] * 0.58 + value * 0.42)
+        prev = bars
         frames.append(bars)
     duration = len(samples) / sample_rate
     return frames or [[0.0] * BAR_COUNT], max(0.8, duration)
@@ -144,12 +154,18 @@ class Visualizer:
         self.play_audio = play_audio
         self.play_started = False
         self.audio_proc: subprocess.Popen | None = None
+        self.audio_paused = False
+        self.audio_skipped = False
         self.minimized = False
         self.drag_offset: tuple[int, int] | None = None
         self.settings = load_settings()
         self.topmost = bool(self.settings.get("topmost", True))
         self.alpha_target = float(self.settings.get("alpha", TARGET_ALPHA) or TARGET_ALPHA)
         self.alpha_target = max(0.35, min(1.0, self.alpha_target))
+        self.phase = random.random() * math.tau
+        self.visual_fade = 0.0
+        self.particles: list[dict[str, float]] = []
+        self.last_particle_t = time.monotonic()
 
         self.root = Tk()
         self.root.overrideredirect(True)
@@ -168,11 +184,11 @@ class Visualizer:
             x = clamp(saved_x, 0, max(0, screen_w - WINDOW_W))
             y = clamp(saved_y, 0, max(0, screen_h - WINDOW_H))
         else:
-            x = max(0, screen_w - WINDOW_W - 18)
-            y = max(0, screen_h - WINDOW_H - 58)
+            x = max(0, screen_w - WINDOW_W - 24)
+            y = max(0, screen_h - WINDOW_H - 70)
         self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+{x}+{y}")
 
-        self.canvas = Canvas(self.root, width=WINDOW_W, height=WINDOW_H, bg="#05070d", bd=0, highlightthickness=0)
+        self.canvas = Canvas(self.root, width=WINDOW_W, height=WINDOW_H, bg="#030712", bd=0, highlightthickness=0)
         self.canvas.pack(fill=BOTH, expand=True)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -221,10 +237,58 @@ class Visualizer:
             log(f"audio playback failed for {self.audio.name}: {exc!r}")
             self.audio_proc = None
 
+    def _ntdll_call(self, func_name: str, pid: int) -> bool:
+        if not sys.platform.startswith("win"):
+            return False
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+            if not handle:
+                return False
+            try:
+                result = getattr(ntdll, func_name)(handle)
+                return int(result) == 0
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception as exc:
+            log(f"{func_name} failed for pid={pid}: {exc!r}")
+            return False
+
+    def _toggle_pause_audio(self) -> None:
+        proc = self.audio_proc
+        if not proc or proc.poll() is not None or self.audio_skipped:
+            log(f"audio pause ignored for {self.audio.name}: no active playback")
+            return
+        if self.audio_paused:
+            if self._ntdll_call("NtResumeProcess", proc.pid):
+                self.audio_paused = False
+                log(f"resumed desktop audio playback for {self.audio.name} pid={proc.pid}")
+            return
+        if self._ntdll_call("NtSuspendProcess", proc.pid):
+            self.audio_paused = True
+            log(f"paused desktop audio playback for {self.audio.name} pid={proc.pid}")
+
+    def _skip_audio(self) -> None:
+        proc = self.audio_proc
+        self.audio_skipped = True
+        self.audio_paused = False
+        if not proc or proc.poll() is not None:
+            log(f"audio skip ignored for {self.audio.name}: no active playback")
+            return
+        try:
+            proc.terminate()
+            log(f"skipped desktop audio playback for {self.audio.name} pid={proc.pid}")
+        except Exception as exc:
+            log(f"audio skip failed for {self.audio.name}: {exc!r}")
+
     def _stop_playback(self) -> None:
         proc = self.audio_proc
         if not proc or proc.poll() is not None:
             return
+        if self.audio_paused:
+            self._ntdll_call("NtResumeProcess", proc.pid)
+            self.audio_paused = False
         try:
             proc.terminate()
         except Exception:
@@ -253,23 +317,27 @@ class Visualizer:
         self.settings["y"] = int(y)
         self.settings["topmost"] = bool(self.topmost)
         self.settings["alpha"] = float(self.alpha_target)
+        self.settings["mode"] = "kuhung_3d"
         save_settings(self.settings)
 
     def _button_at(self, x: int, y: int) -> str | None:
         if y > HEADER_H:
             return None
-        # Right-side custom controls: minimize, layer/topmost, close.
         if WINDOW_W - 35 <= x <= WINDOW_W - 12:
             return "close"
         if WINDOW_W - 64 <= x <= WINDOW_W - 41:
             return "layer"
         if WINDOW_W - 93 <= x <= WINDOW_W - 70:
             return "minimize"
+        if WINDOW_W - 122 <= x <= WINDOW_W - 100:
+            return "skip_audio"
+        if WINDOW_W - 151 <= x <= WINDOW_W - 129:
+            return "pause_audio"
         if self.minimized and 0 <= x <= MINI_W and 0 <= y <= MINI_H:
             return "restore"
         return None
 
-    def _on_press(self, event) -> None:  # tkinter event, intentionally untyped
+    def _on_press(self, event) -> None:
         button = self._button_at(event.x, event.y)
         if button == "close":
             self.fade_close()
@@ -279,6 +347,14 @@ class Visualizer:
             return
         if button in {"minimize", "restore"}:
             self.toggle_minimize()
+            return
+        if button == "pause_audio":
+            self._toggle_pause_audio()
+            self.draw()
+            return
+        if button == "skip_audio":
+            self._skip_audio()
+            self.draw()
             return
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
@@ -345,25 +421,47 @@ class Visualizer:
         self._set_alpha(self.alpha_target)
         return True
 
+    def _smoothstep(self, value: float) -> float:
+        value = max(0.0, min(1.0, value))
+        return value * value * (3.0 - 2.0 * value)
+
+    def _visual_visibility(self, elapsed: float, total_life: float) -> float:
+        # Window alpha fades the whole HUD. This second envelope fades the sphere
+        # itself as a soft cyan/violet gradient so it blooms in and dissolves out,
+        # instead of popping like a bureaucratic PowerPoint transition.
+        in_v = self._smoothstep(elapsed / max(0.01, VISUAL_FADE_IN_SECONDS))
+        remaining = total_life - elapsed
+        out_v = self._smoothstep(remaining / max(0.01, VISUAL_FADE_OUT_SECONDS))
+        return max(0.0, min(1.0, in_v, out_v))
+
+    def _blend_hex(self, a: str, b: str, t: float) -> str:
+        t = max(0.0, min(1.0, t))
+        ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+        br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+        return f"#{int(ar + (br - ar) * t):02x}{int(ag + (bg - ag) * t):02x}{int(ab + (bb - ab) * t):02x}"
+
+    def _fade_hex(self, color: str, visibility: float, background: str = "#020617") -> str:
+        return self._blend_hex(background, color, self._smoothstep(visibility))
+
     def _draw_controls(self) -> None:
-        # Small, intentionally quiet controls. Apparently windows behave better when
-        # given manners and a few buttons.
-        fill = "#162033"
+        fill = "#111827"
         outline = "#334155"
         controls = [
-            (WINDOW_W - 92, WINDOW_W - 70, "—", "minimize"),
+            (WINDOW_W - 150, WINDOW_W - 129, "R" if self.audio_paused else "P", "pause_audio"),
+            (WINDOW_W - 121, WINDOW_W - 100, "S", "skip_audio"),
+            (WINDOW_W - 92, WINDOW_W - 70, "–", "minimize"),
             (WINDOW_W - 63, WINDOW_W - 41, "T" if self.topmost else "L", "layer"),
             (WINDOW_W - 34, WINDOW_W - 12, "×", "close"),
         ]
         for x0, x1, label, _name in controls:
-            self.canvas.create_rectangle(x0, 7, x1, 25, fill=fill, outline=outline)
-            self.canvas.create_text((x0 + x1) / 2, 15, text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
+            self.canvas.create_rectangle(x0, 8, x1, 26, fill=fill, outline=outline)
+            self.canvas.create_text((x0 + x1) / 2, 16, text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
 
     def _draw_header(self) -> None:
-        self.canvas.create_rectangle(0, 0, WINDOW_W, HEADER_H, fill="#07111f", outline="#152033")
-        self.canvas.create_text(MARGIN, 15, anchor="w", text="HERMES TTS", fill="#7dd3fc", font=("Segoe UI", 9, "bold"))
-        caption_x = MARGIN + 92
-        caption_right = WINDOW_W - 104
+        self.canvas.create_rectangle(0, 0, WINDOW_W, HEADER_H, fill="#06111f", outline="#132033")
+        self.canvas.create_text(MARGIN, 17, anchor="w", text="HERMES TTS · 3D BLOOM", fill="#f8fafc", font=("Segoe UI", 9, "bold"))
+        caption_x = MARGIN + 142
+        caption_right = WINDOW_W - 160
         caption_w = max(40, caption_right - caption_x)
         caption = self.text or self.audio.name
         item = self.canvas.create_text(0, -100, anchor="w", text=caption, fill="#cbd5e1", font=("Segoe UI", 8))
@@ -376,24 +474,22 @@ class Visualizer:
             cycle_w = text_w + caption_w + 42
             offset = (time.monotonic() - self.started_at) * 42 % cycle_w
             x = caption_x + caption_w - offset
-        self.canvas.create_text(x, 15, anchor="w", text=caption, fill="#cbd5e1", font=("Segoe UI", 8))
-        # Mask the marquee so it does not wander into title/buttons like a drunk ticker.
-        self.canvas.create_rectangle(0, 0, caption_x - 2, HEADER_H, fill="#07111f", outline="")
-        self.canvas.create_rectangle(caption_right + 2, 0, WINDOW_W, HEADER_H, fill="#07111f", outline="")
-        self.canvas.create_text(MARGIN, 15, anchor="w", text="HERMES TTS", fill="#7dd3fc", font=("Segoe UI", 9, "bold"))
+        self.canvas.create_text(x, 17, anchor="w", text=caption, fill="#cbd5e1", font=("Segoe UI", 8))
+        self.canvas.create_rectangle(0, 0, caption_x - 2, HEADER_H, fill="#06111f", outline="")
+        self.canvas.create_rectangle(caption_right + 2, 0, WINDOW_W, HEADER_H, fill="#06111f", outline="")
+        self.canvas.create_text(MARGIN, 17, anchor="w", text="HERMES TTS · 3D BLOOM", fill="#f8fafc", font=("Segoe UI", 9, "bold"))
         self._draw_controls()
 
     def _draw_minimized(self) -> None:
         self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, MINI_W, MINI_H, fill="#05070d", outline="#334155")
-        self.canvas.create_oval(10, 11, 22, 23, fill="#22d3ee", outline="")
-        label = "HERMES TTS  ▣" if self.topmost else "HERMES TTS  □"
-        self.canvas.create_text(31, 17, anchor="w", text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
+        self.canvas.create_rectangle(0, 0, MINI_W, MINI_H, fill="#030712", outline="#334155")
+        cx, cy = 18, 17
+        pulse = 5 + 2.5 * math.sin(time.monotonic() * 4)
+        self.canvas.create_oval(cx - pulse, cy - pulse, cx + pulse, cy + pulse, outline="#22d3ee", width=2)
+        label = ("PAUSED" if self.audio_paused else "HERMES · 3D BLOOM") if self.topmost else "HERMES · LAYER"
+        self.canvas.create_text(34, 17, anchor="w", text=label, fill="#cbd5e1", font=("Segoe UI", 8, "bold"))
 
     def _wait_then_start(self) -> None:
-        # Keep playback and motion aligned: wait briefly for ffmpeg decoding before
-        # starting ffplay. If decoding is slow or unavailable, start anyway rather
-        # than leaving a polite but useless dark rectangle.
         if not self.loaded and time.monotonic() - self.load_started_at < 2.0:
             self.root.after(50, self._wait_then_start)
             return
@@ -402,98 +498,186 @@ class Visualizer:
         self._start_playback()
         self.draw()
 
-    def _blend_hex(self, a: str, b: str, t: float) -> str:
-        t = max(0.0, min(1.0, t))
-        ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
-        br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
-        return f"#{int(ar + (br - ar) * t):02x}{int(ag + (bg - ag) * t):02x}{int(ab + (bb - ab) * t):02x}"
+    def _current_frame(self) -> list[float]:
+        return self.frames[min(self.index, len(self.frames) - 1)]
 
-    def _draw_radial_visualizer(self, frame: list[float], elapsed: float, progress: float) -> None:
-        # A tiny Processing-style sketch implemented directly on Tk Canvas:
-        # polar samples, orbital phase, translucent-looking layers, and no
-        # external dependency. Processing itself is marvellous, but requiring it
-        # for a corner HUD would be a rather theatrical way to draw a circle.
-        cx = WINDOW_W / 2
-        cy = HEADER_H + (WINDOW_H - HEADER_H) / 2 + 5
-        pulse = sum(frame) / max(1, len(frame))
-        beat = min(1.0, pulse * 1.8)
-        spin = elapsed * 0.92
-        inner_r = 19 + beat * 6
-        base_r = 42 + beat * 13
-        outer_r = 54 + beat * 23
+    def _frame_energy(self, frame: list[float]) -> float:
+        if not frame:
+            return 0.0
+        return min(1.0, sum(frame) / len(frame) * 1.75)
 
-        # Soft neon halo, faked with concentric outlines because Tk has the
-        # alpha support of a Victorian gas lamp.
-        for layer in range(7, 0, -1):
-            r = outer_r + layer * 5 + math.sin(elapsed * 1.7 + layer) * 1.8
-            color = self._blend_hex("#05070d", "#155e75", layer / 9)
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, width=1)
-
-        # Outer organic waveform: closed polar spline-ish polyline.
-        points: list[float] = []
+    def _split_energy(self, frame: list[float]) -> tuple[float, float, float]:
+        if not frame:
+            return 0.0, 0.0, 0.0
         n = len(frame)
-        for i, amp in enumerate(frame):
-            theta = (math.tau * i / n) - math.pi / 2 + spin * 0.18
-            eased = amp ** 0.55
-            wobble = math.sin(theta * 3.0 + elapsed * 2.2) * 4.5 + math.sin(theta * 7.0 - elapsed * 1.4) * 2.4
-            r = base_r + eased * 49 + wobble
-            points.extend([cx + math.cos(theta) * r, cy + math.sin(theta) * r])
-        if len(points) >= 6:
-            self.canvas.create_polygon(points, fill="", outline="#22d3ee", width=2, smooth=True)
+        low = sum(frame[: max(1, n // 4)]) / max(1, n // 4)
+        mid = sum(frame[n // 4 : max(n // 4 + 1, n * 2 // 3)]) / max(1, n * 2 // 3 - n // 4)
+        high = sum(frame[n * 2 // 3 :]) / max(1, n - n * 2 // 3)
+        return min(1.0, low * 1.9), min(1.0, mid * 2.2), min(1.0, high * 2.8)
 
-        # Counter-rotating violet trace for that pleasantly ominous lab-instrument look.
-        trace: list[float] = []
-        for i, amp in enumerate(reversed(frame)):
-            theta = (math.tau * i / n) - math.pi / 2 - spin * 0.12
-            eased = amp ** 0.65
-            r = inner_r + eased * 38 + math.sin(theta * 5.0 + elapsed) * 3
-            trace.extend([cx + math.cos(theta) * r, cy + math.sin(theta) * r])
-        if len(trace) >= 6:
-            self.canvas.create_polygon(trace, fill="", outline="#a78bfa", width=1, smooth=True)
+    def _pseudo_noise(self, x: float, y: float, z: float, t: float) -> float:
+        # Lightweight Perlin-ish layered sine noise. It mirrors the WebGL shader's
+        # role without pulling in a shader runtime or extra dependencies.
+        return (
+            math.sin(x * 1.85 + t * 1.27 + self.phase)
+            + 0.62 * math.sin(y * 2.35 - t * 1.71)
+            + 0.45 * math.sin((x + z) * 2.8 + t * 0.84)
+            + 0.32 * math.sin(math.sqrt(x * x + y * y + z * z) * 4.2 - t * 2.1)
+        ) / 2.39
 
-        # Radial shards: not bars, more like a small cybernetic sea urchin.
-        for i in range(0, n, 2):
-            amp = frame[i]
-            eased = amp ** 0.5
-            theta = (math.tau * i / n) - math.pi / 2 + spin * 0.24
-            r0 = inner_r + eased * 9
-            r1 = base_r + 12 + eased * 54
-            color = self._blend_hex("#38bdf8", "#c084fc", (math.sin(theta + elapsed) + 1) / 2)
-            self.canvas.create_line(
-                cx + math.cos(theta) * r0,
-                cy + math.sin(theta) * r0,
-                cx + math.cos(theta) * r1,
-                cy + math.sin(theta) * r1,
-                fill=color,
-                width=max(1, int(1 + eased * 3)),
-            )
+    def _rotate_project(self, x: float, y: float, z: float, t: float, cx: float, cy: float, scale: float) -> tuple[float, float, float]:
+        ay = t * 0.34 + self.phase * 0.25
+        ax = -0.62 + math.sin(t * 0.23) * 0.12
+        ca, sa = math.cos(ay), math.sin(ay)
+        x, z = x * ca + z * sa, -x * sa + z * ca
+        ca, sa = math.cos(ax), math.sin(ax)
+        y, z = y * ca - z * sa, y * sa + z * ca
+        perspective = 1.0 / max(0.34, 1.95 - z * 0.38)
+        return cx + x * scale * perspective, cy + y * scale * perspective, perspective
 
-        # Orbiting particles driven by local amplitude.
-        for i in range(12):
-            amp = frame[(i * 4 + self.index) % n]
-            theta = math.tau * i / 12 + spin * (0.45 + (i % 3) * 0.07)
-            r = outer_r + 12 + math.sin(elapsed * 2 + i) * 8 + amp * 23
-            size = 2.0 + amp * 5.0
-            px = cx + math.cos(theta) * r
-            py = cy + math.sin(theta) * r
-            self.canvas.create_oval(px - size, py - size, px + size, py + size, fill="#67e8f9", outline="")
+    def _draw_glow_line(self, x0: float, y0: float, x1: float, y1: float, color: str, width: int = 1, visibility: float = 1.0) -> None:
+        if visibility <= 0.015:
+            return
+        v = self._smoothstep(visibility)
+        glow_w = max(1, int((width + 5) * (0.35 + 0.65 * v)))
+        mid_w = max(1, int((width + 2) * (0.45 + 0.55 * v)))
+        core_w = max(1, int(width * (0.65 + 0.35 * v)))
+        self.canvas.create_line(x0, y0, x1, y1, fill=self._fade_hex("#172554", visibility), width=glow_w, capstyle="round")
+        self.canvas.create_line(x0, y0, x1, y1, fill=self._fade_hex("#0e7490", visibility), width=mid_w, capstyle="round")
+        self.canvas.create_line(x0, y0, x1, y1, fill=self._fade_hex(color, visibility), width=core_w, capstyle="round")
 
-        # Core and circular progress ring.
-        core_r = inner_r + beat * 5
-        self.canvas.create_oval(cx - core_r, cy - core_r, cx + core_r, cy + core_r, fill="#07111f", outline="#67e8f9", width=2)
-        self.canvas.create_text(cx, cy, text="◌", fill="#e0f2fe", font=("Segoe UI Symbol", 20, "bold"))
-        ring_r = outer_r + 28
-        self.canvas.create_arc(
-            cx - ring_r,
-            cy - ring_r,
-            cx + ring_r,
-            cy + ring_r,
-            start=90,
-            extent=-359.5 * progress,
-            style="arc",
-            outline="#38bdf8",
-            width=3,
-        )
+    def _draw_wire_sphere(self, cx: float, cy: float, frame: list[float], energy: float, progress: float, t: float, visibility: float = 1.0) -> None:
+        lat_steps = 9
+        lon_steps = 22
+        v = self._smoothstep(visibility)
+        sphere_scale = 0.58 + 0.42 * v
+        base = 1.0 + energy * 0.12
+        amp = (0.18 + energy * 0.42) * (0.35 + 0.65 * v)
+        points: list[list[tuple[float, float, float]]] = []
+        for lat in range(1, lat_steps):
+            theta = -math.pi / 2 + math.pi * lat / lat_steps
+            row = []
+            for lon in range(lon_steps):
+                phi = math.tau * lon / lon_steps
+                sx = math.cos(theta) * math.cos(phi)
+                sy = math.sin(theta)
+                sz = math.cos(theta) * math.sin(phi)
+                band = frame[(lon * len(frame) // lon_steps) % len(frame)] if frame else 0.0
+                noise = self._pseudo_noise(sx, sy, sz, t)
+                r = base + noise * amp + min(1.0, band * 2.4) * 0.16
+                row.append(self._rotate_project(sx * r, sy * r, sz * r, t, cx, cy, 116 * sphere_scale))
+            points.append(row)
+
+        # Latitude rings.
+        for row_i, row in enumerate(points):
+            for lon in range(lon_steps):
+                x0, y0, p0 = row[lon]
+                x1, y1, p1 = row[(lon + 1) % lon_steps]
+                depth = (p0 + p1) * 0.5
+                color = "#f8fafc" if depth > 0.72 and row_i % 3 == 0 else ("#67e8f9" if row_i % 2 else "#a78bfa")
+                self._draw_glow_line(x0, y0, x1, y1, color, 1 if depth < 0.72 else 2, visibility)
+
+        # Longitude arcs.
+        for lon in range(0, lon_steps, 2):
+            for row_i in range(len(points) - 1):
+                x0, y0, p0 = points[row_i][lon]
+                x1, y1, p1 = points[row_i + 1][lon]
+                depth = (p0 + p1) * 0.5
+                color = "#38bdf8" if lon % 4 else "#c084fc"
+                self._draw_glow_line(x0, y0, x1, y1, color, 1 if depth < 0.78 else 2, visibility)
+
+        # Icosahedron-like triangular chords over the sphere, giving the original repo's wireframe mesh feeling.
+        for lon in range(0, lon_steps, 3):
+            for row_i in range(0, len(points) - 2, 2):
+                a = points[row_i][lon]
+                b = points[row_i + 1][(lon + 2) % lon_steps]
+                c = points[row_i + 2][(lon + 1) % lon_steps]
+                color = "#f0f9ff" if (lon + row_i) % 4 == 0 else "#22d3ee"
+                self._draw_glow_line(a[0], a[1], b[0], b[1], color, 1, visibility)
+                self._draw_glow_line(b[0], b[1], c[0], c[1], color, 1, visibility)
+
+        # Progress halo.
+        ring_r = (190 + energy * 20) * sphere_scale
+        self.canvas.create_arc(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r, start=90, extent=-359.9, outline=self._fade_hex("#111827", visibility), width=5, style="arc")
+        self.canvas.create_arc(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r, start=90, extent=-359.9 * progress, outline=self._fade_hex("#f8fafc", visibility), width=2, style="arc")
+        self.canvas.create_arc(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r, start=90, extent=-359.9 * progress, outline=self._fade_hex("#22d3ee", visibility), width=5, style="arc")
+
+    def _spawn_particles(self, energy: float, low: float) -> None:
+        spawn = 2 + int(energy * 8) + int(low * 6)
+        max_particles = 260
+        for _ in range(spawn):
+            if len(self.particles) >= max_particles:
+                self.particles.pop(0)
+            angle = random.random() * math.tau
+            self.particles.append({
+                "a": angle,
+                "r": random.random() * 9.0,
+                "vr": 1.3 + random.random() * 2.2 + energy * 4.6,
+                "y": 0.0,
+                "vy": 0.9 + low * 4.2 + random.random() * 1.8,
+                "life": 1.0,
+                "size": 1.1 + random.random() * 2.2 + energy * 2.2,
+            })
+
+    def _draw_particles(self, cx: float, cy: float, energy: float, low: float, t: float, visibility: float = 1.0) -> None:
+        now = time.monotonic()
+        dt = max(0.01, min(0.08, now - self.last_particle_t))
+        self.last_particle_t = now
+        if energy > 0.035 and visibility > 0.18:
+            self._spawn_particles(energy * visibility, low * visibility)
+        alive: list[dict[str, float]] = []
+        for p in self.particles:
+            p["r"] += p["vr"] * dt * 42
+            p["vy"] -= 4.9 * dt
+            p["y"] = max(0.0, p["y"] + p["vy"] * dt * 34)
+            p["life"] -= dt * (0.42 + p["r"] / 620)
+            if p["life"] <= 0 or p["r"] > 230:
+                continue
+            alive.append(p)
+            a = p["a"] + math.sin(t * 0.7 + p["r"] * 0.01) * 0.12
+            x = cx + math.cos(a) * p["r"]
+            z = math.sin(a) * p["r"]
+            y = cy + z * 0.34 - p["y"]
+            fade = max(0.0, min(1.0, p["life"]))
+            particle_visibility = visibility * fade
+            size = p["size"] * (0.45 + fade) * (0.45 + 0.55 * self._smoothstep(visibility))
+            color = "#f8fafc" if p["r"] < 44 else ("#67e8f9" if int(p["r"]) % 2 else "#a78bfa")
+            self.canvas.create_oval(x - size * 2.4, y - size * 2.4, x + size * 2.4, y + size * 2.4, outline=self._fade_hex("#0e7490", particle_visibility), width=1)
+            self.canvas.create_oval(x - size, y - size, x + size, y + size, fill=self._fade_hex(color, particle_visibility), outline="")
+        self.particles = alive
+
+    def _draw_circular_body(self, frame: list[float], progress: float, visibility: float = 1.0) -> None:
+        cx = WINDOW_W / 2
+        cy = HEADER_H + (WINDOW_H - HEADER_H) / 2 + 14
+        energy = self._frame_energy(frame)
+        low, mid, high = self._split_energy(frame)
+        t = time.monotonic() - self.started_at
+
+        # Dark WebGL-like scene background with bloom-friendly rings.
+        self.canvas.create_rectangle(0, HEADER_H, WINDOW_W, WINDOW_H, fill="#020617", outline="")
+        v = self._smoothstep(visibility)
+        scene_scale = 0.82 + 0.18 * v
+        for k, (r, color) in enumerate([(238, "#050b1e"), (205, "#081427"), (166, "#0b1735"), (126, "#061d2d")]):
+            rr = r * scene_scale
+            self.canvas.create_oval(cx - rr, cy - rr * 0.82, cx + rr, cy + rr * 0.82, outline=self._fade_hex(color, visibility), width=max(1, int((8 - k) * (0.55 + 0.45 * v))))
+        for r, color, width in [(218, "#172554", 1), (174, "#0e7490", 1), (132, "#312e81", 1), (84, "#164e63", 1)]:
+            rr = r * scene_scale
+            self.canvas.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=self._fade_hex(color, visibility), width=width)
+
+        # Particle/ripple system: center spawn, outward spread, vertical kick.
+        self._draw_particles(cx, cy + 42, energy, low, t, visibility)
+
+        # Shader-like displaced wireframe 3D object.
+        self._draw_wire_sphere(cx, cy - 8, frame, energy, progress, t, visibility)
+
+        # Core label and status.
+        core = (42 + low * 16 + mid * 10) * (0.72 + 0.28 * v)
+        self.canvas.create_oval(cx - core * 1.55, cy - 8 - core * 1.55, cx + core * 1.55, cy - 8 + core * 1.55, outline=self._fade_hex("#0e7490", visibility), width=max(1, int(7 * (0.45 + 0.55 * v))))
+        self.canvas.create_oval(cx - core, cy - 8 - core, cx + core, cy - 8 + core, fill="#020617", outline=self._fade_hex("#f8fafc", visibility), width=2)
+        self.canvas.create_text(cx, cy - 22, text="HERMES", fill=self._fade_hex("#f8fafc", visibility), font=("Segoe UI", 17, "bold"))
+        status = "SKIPPED" if self.audio_skipped else ("PAUSED" if self.audio_paused else (self.provider or "3D AUDIO").upper()[:18])
+        self.canvas.create_text(cx, cy + 5, text=status, fill=self._fade_hex("#67e8f9", visibility), font=("Segoe UI", 8, "bold"))
+        self.canvas.create_text(cx, cy + 22, text="WIREFRAME · BLOOM · PARTICLES", fill=self._fade_hex("#a5b4fc", visibility), font=("Segoe UI", 7, "bold"))
 
     def draw(self) -> None:
         elapsed = time.monotonic() - self.started_at
@@ -501,17 +685,19 @@ class Visualizer:
         if not self._apply_timed_alpha(elapsed, total_life):
             self._close_window()
             return
+        visibility = self._visual_visibility(elapsed, total_life)
+        self.visual_fade = visibility
         if self.minimized:
             self._draw_minimized()
             self.root.after(int(1000 / FPS), self.draw)
             return
 
         self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, WINDOW_W, WINDOW_H, fill="#05070d", outline="#152033")
+        self.canvas.create_rectangle(0, 0, WINDOW_W, WINDOW_H, fill="#030712", outline="#172033")
         self._draw_header()
-        frame = self.frames[min(self.index, len(self.frames) - 1)]
+        frame = self._current_frame()
         progress = min(1.0, self.index / max(1, len(self.frames)))
-        self._draw_radial_visualizer(frame, elapsed, progress)
+        self._draw_circular_body(frame, progress, visibility)
         self.index += 1
         if elapsed <= total_life:
             self.root.after(int(1000 / FPS), self.draw)
@@ -539,4 +725,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        log("visualizer fatal error:\n" + traceback.format_exc())
+        raise
