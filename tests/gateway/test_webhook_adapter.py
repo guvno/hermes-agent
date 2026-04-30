@@ -707,6 +707,7 @@ class TestDeliverCrossPlatformThreadId:
         adapter = _make_adapter()
         mock_target = AsyncMock()
         mock_target.send = AsyncMock(return_value=SendResult(success=True))
+        mock_target.play_tts = AsyncMock(return_value=SendResult(success=True))
 
         mock_runner = MagicMock()
         mock_runner.adapters = {Platform("telegram"): mock_target}
@@ -758,3 +759,51 @@ class TestDeliverCrossPlatformThreadId:
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata=None
         )
+
+    @pytest.mark.asyncio
+    async def test_voice_reply_sends_tts_before_text(self, tmp_path):
+        """voice_reply=true generates TTS and sends it before the text response."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        audio_path = tmp_path / "reply.ogg"
+        audio_path.write_bytes(b"fake audio")
+        delivery = {
+            "voice_reply": True,
+            "deliver_extra": {
+                "chat_id": "12345",
+                "thread_id": "999",
+            },
+        }
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), \
+             patch("tools.tts_tool.text_to_speech_tool", return_value=json.dumps({"file_path": str(audio_path)})), \
+             patch("hermes_cli.config.load_config", return_value={"tts": {"auto_chunk_chars": 1200, "auto_max_chunks": 3}}):
+            await adapter._deliver_cross_platform("telegram", "hello **voice**", delivery)
+
+        mock_target.play_tts.assert_awaited_once_with(
+            chat_id="12345",
+            audio_path=str(audio_path),
+            metadata={"thread_id": "999"},
+        )
+        mock_target.send.assert_awaited_once_with(
+            "12345", "hello **voice**", metadata={"thread_id": "999"}
+        )
+        assert not audio_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_voice_reply_can_skip_text(self, tmp_path):
+        """text_reply=false makes webhook delivery voice-only."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        audio_path = tmp_path / "reply.ogg"
+        audio_path.write_bytes(b"fake audio")
+        delivery = {
+            "voice_reply": True,
+            "text_reply": False,
+            "deliver_extra": {"chat_id": "12345"},
+        }
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), \
+             patch("tools.tts_tool.text_to_speech_tool", return_value=json.dumps({"file_path": str(audio_path)})), \
+             patch("hermes_cli.config.load_config", return_value={"tts": {"auto_chunk_chars": 1200, "auto_max_chunks": 3}}):
+            result = await adapter._deliver_cross_platform("telegram", "hello voice", delivery)
+
+        assert result.success is True
+        mock_target.play_tts.assert_awaited_once()
+        mock_target.send.assert_not_awaited()

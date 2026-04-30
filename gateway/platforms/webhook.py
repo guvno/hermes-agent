@@ -607,6 +607,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_config.get("deliver_extra", {}), payload
             ),
             "payload": payload,
+            # Optional route-level voice delivery.  Useful for webhook-originated
+            # voice commands that are delivered into a chat as a cross-platform
+            # response, where the original event is MessageType.TEXT and the
+            # normal per-chat voice auto-TTS gate cannot fire.
+            "voice_reply": bool(route_config.get("voice_reply", False)),
+            "text_reply": route_config.get("text_reply", True),
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -872,4 +878,93 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
+        voice_reply = bool(delivery.get("voice_reply") or extra.get("voice_reply"))
+        text_reply = delivery.get("text_reply", extra.get("text_reply", True))
+        if voice_reply and content:
+            tts_result = await self._deliver_cross_platform_tts(
+                adapter=adapter,
+                chat_id=str(chat_id),
+                content=content,
+                metadata=metadata,
+            )
+            if not text_reply:
+                return tts_result
+
         return await adapter.send(chat_id, content, metadata=metadata)
+
+    async def _deliver_cross_platform_tts(
+        self,
+        *,
+        adapter: BasePlatformAdapter,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Generate TTS for a webhook cross-platform delivery and send it.
+
+        Webhook events are synthetic TEXT messages, so BasePlatformAdapter's
+        normal auto-TTS path (which requires MessageType.VOICE) cannot see that
+        the original upstream input was spoken.  Routes can opt in with
+        ``voice_reply: true`` to provide the voice-first behaviour expected by
+        local voice-command bridges.
+        """
+        try:
+            from pathlib import Path
+            from tools.tts_tool import (
+                check_tts_requirements,
+                split_text_for_tts,
+                text_to_speech_tool,
+            )
+            import json as _json
+            from hermes_cli.config import load_config as _load_full_config
+
+            if not check_tts_requirements():
+                return SendResult(success=False, error="TTS provider unavailable")
+
+            clean = content.replace("[[audio_as_voice]]", "").strip()
+            clean = re.sub(r"MEDIA:\s*\S+", "", clean).strip()
+            clean = re.sub(r"```[\s\S]*?```", " ", clean)
+            clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", clean)
+            clean = re.sub(r"https?://\S+", "", clean)
+            clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
+            clean = re.sub(r"\*(.+?)\*", r"\1", clean)
+            clean = re.sub(r"`(.+?)`", r"\1", clean)
+            clean = re.sub(r"^#+\s*", "", clean, flags=re.MULTILINE)
+            clean = re.sub(r"^\s*[-*]\s+", "", clean, flags=re.MULTILINE)
+            clean = re.sub(r"---+", "", clean)
+            clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+            if not clean:
+                return SendResult(success=False, error="No speakable text")
+
+            tts_cfg = (_load_full_config().get("tts") or {})
+            max_chunk_chars = int(tts_cfg.get("auto_chunk_chars", 1200))
+            max_chunks = int(tts_cfg.get("auto_max_chunks", 3))
+            chunks = split_text_for_tts(clean[:4000], max_chars=max_chunk_chars, max_chunks=max_chunks)
+            if not chunks:
+                return SendResult(success=False, error="No TTS chunks")
+
+            last_result = SendResult(success=True)
+            for speech_text in chunks:
+                if not speech_text:
+                    continue
+                tts_result_str = await asyncio.to_thread(text_to_speech_tool, text=speech_text)
+                tts_data = _json.loads(tts_result_str)
+                audio_path = tts_data.get("file_path")
+                if not audio_path:
+                    continue
+                try:
+                    if Path(audio_path).exists():
+                        last_result = await adapter.play_tts(
+                            chat_id=chat_id,
+                            audio_path=audio_path,
+                            metadata=metadata,
+                        )
+                finally:
+                    try:
+                        Path(audio_path).unlink()
+                    except OSError:
+                        pass
+            return last_result
+        except Exception as exc:
+            logger.warning("[webhook] Cross-platform TTS delivery failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
