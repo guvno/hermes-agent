@@ -9993,8 +9993,18 @@ class GatewayRunner:
                 return True
             return self._is_session_run_current(session_key, run_generation)
         
+        from gateway.config import Platform
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        visible_platform_key = platform_key
+        if source.platform == Platform.WEBHOOK:
+            try:
+                _source_adapter = self.adapters.get(source.platform)
+                _delivery_key_fn = getattr(_source_adapter, "delivery_platform_key_for_chat", None)
+                if callable(_delivery_key_fn):
+                    visible_platform_key = _delivery_key_fn(source.chat_id) or platform_key
+            except Exception:
+                visible_platform_key = platform_key
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -10011,31 +10021,33 @@ class GatewayRunner:
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len
-            _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
+            _tpl = resolve_display_setting(user_config, visible_platform_key, "tool_preview_length", 0)
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
         except Exception:
             pass
 
         # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
+        _resolved_tp = resolve_display_setting(user_config, visible_platform_key, "tool_progress")
         progress_mode = (
-            _resolved_tp
-            or os.getenv("HERMES_TOOL_PROGRESS_MODE")
+            os.getenv("HERMES_TOOL_PROGRESS_MODE")
+            or _resolved_tp
             or "all"
         )
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
-        from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        # Webhook routes can deliver into rich chat platforms (Telegram, Discord,
+        # etc.).  Use the visible delivery platform's settings/capabilities so
+        # voice-sphere behaves like native Telegram instead of a log-only webhook.
+        tool_progress_enabled = progress_mode != "off"
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
-        interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
-            and is_truthy_value(
+        interim_assistant_messages_enabled = is_truthy_value(
+            resolve_display_setting(
+                user_config,
+                visible_platform_key,
+                "interim_assistant_messages",
                 display_config.get("interim_assistant_messages"),
-                default=True,
-            )
+            ),
+            default=True,
         )
         
         # Queue for progress messages (thread-safe)
@@ -10448,7 +10460,7 @@ class GatewayRunner:
             # can disable streaming for specific platforms even when the global
             # streaming config is enabled.
             _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming"
+                user_config, visible_platform_key, "streaming"
             )
             # None = no per-platform override → follow global config
             _streaming_enabled = (

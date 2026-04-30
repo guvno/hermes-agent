@@ -11,6 +11,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.webhook import WebhookAdapter
 from gateway.session import SessionSource
 
 
@@ -38,12 +39,13 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="progress-1")
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -61,7 +63,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
@@ -956,6 +958,77 @@ async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
     ]
     assert len(normal_typing_calls) == 1
     assert len(stopped_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_uses_visible_telegram_progress_settings(monkeypatch, tmp_path):
+    """Webhook routes delivered to Telegram should show Telegram-style progress."""
+    import yaml
+
+    monkeypatch.delenv("HERMES_TOOL_PROGRESS_MODE", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "tool_progress": "off",
+                    "platforms": {"telegram": {"tool_progress": "all"}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
+
+    telegram = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    webhook = WebhookAdapter(PlatformConfig(enabled=True, extra={"routes": {}, "port": 0}))
+    source_chat = "webhook:voice-sphere:req-progress"
+    webhook._delivery_info[source_chat] = {
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "1403442542", "thread_id": "17585"},
+        "payload": {},
+    }
+
+    runner = _make_runner(webhook)
+    runner.adapters = {Platform.WEBHOOK: webhook, Platform.TELEGRAM: telegram}
+    runner.config.get_home_channel = lambda platform: None
+    webhook.gateway_runner = runner
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id=source_chat,
+        chat_type="webhook",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-webhook-progress",
+        session_key=source_chat,
+    )
+
+    assert result["final_response"] == "done"
+    assert telegram.sent
+    assert telegram.sent[0]["chat_id"] == "1403442542"
+    assert telegram.sent[0]["metadata"] == {"thread_id": "17585"}
+    progress_text = " ".join(call["content"] for call in telegram.sent)
+    progress_text += " ".join(call["content"] for call in telegram.edits)
+    assert "pwd" in progress_text
+    assert telegram.edits
 
 
 @pytest.mark.asyncio

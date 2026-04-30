@@ -706,8 +706,17 @@ class TestDeliverCrossPlatformThreadId:
         """Set up a webhook adapter with a mocked gateway_runner and target adapter."""
         adapter = _make_adapter()
         mock_target = AsyncMock()
-        mock_target.send = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        mock_target.edit_message = AsyncMock(return_value=SendResult(success=True))
+        mock_target.delete_message = AsyncMock(return_value=True)
+        mock_target.send_typing = AsyncMock()
         mock_target.play_tts = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_voice = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_image = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_animation = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_image_file = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_video = AsyncMock(return_value=SendResult(success=True))
+        mock_target.send_document = AsyncMock(return_value=SendResult(success=True))
 
         mock_runner = MagicMock()
         mock_runner.adapters = {Platform("telegram"): mock_target}
@@ -802,6 +811,81 @@ class TestDeliverCrossPlatformThreadId:
 
         mock_target.send_typing.assert_awaited_once_with(
             "12345", metadata={"thread_id": "888"}
+        )
+
+    def test_delivery_platform_key_for_chat_uses_target_platform(self):
+        """Display settings can resolve against the visible delivery platform."""
+        adapter, _mock_target = self._setup_adapter_with_mock_target()
+        chat_id = "webhook:voice-sphere:req-display"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "12345"},
+        }
+
+        assert adapter.delivery_platform_key_for_chat(chat_id) == "telegram"
+
+    @pytest.mark.asyncio
+    async def test_edit_and_delete_forward_to_delivery_target(self):
+        """Webhook progress/stream edits use the target platform message APIs."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        chat_id = "webhook:voice-sphere:req-progress"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "12345", "thread_id": "999"},
+        }
+
+        result = await adapter.edit_message(chat_id, "777", "working", finalize=True)
+        deleted = await adapter.delete_message(chat_id, "777")
+
+        assert result.success is True
+        assert deleted is True
+        mock_target.edit_message.assert_awaited_once_with(
+            chat_id="12345",
+            message_id="777",
+            content="working",
+            finalize=True,
+        )
+        mock_target.delete_message.assert_awaited_once_with("12345", "777")
+
+    @pytest.mark.asyncio
+    async def test_native_media_methods_forward_to_delivery_target(self):
+        """Webhook-originated MEDIA outputs stay native when delivered to Telegram."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        chat_id = "webhook:voice-sphere:req-media"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "12345", "thread_id": "999"},
+        }
+
+        await adapter.send_voice(chat_id, "/tmp/reply.ogg", caption="voice")
+        await adapter.play_tts(chat_id, "/tmp/tts.ogg")
+        await adapter.send_image(chat_id, "https://example.com/a.png", caption="img")
+        await adapter.send_animation(chat_id, "https://example.com/a.gif", caption="gif")
+        await adapter.send_image_file(chat_id, "/tmp/a.png", caption="file-img")
+        await adapter.send_video(chat_id, "/tmp/a.mp4", caption="video")
+        await adapter.send_document(chat_id, "/tmp/a.pdf", caption="doc", file_name="a.pdf")
+
+        meta = {"thread_id": "999"}
+        mock_target.send_voice.assert_awaited_once_with(
+            "12345", "/tmp/reply.ogg", caption="voice", reply_to=None, metadata=meta
+        )
+        mock_target.play_tts.assert_awaited_once_with(
+            "12345", "/tmp/tts.ogg", metadata=meta
+        )
+        mock_target.send_image.assert_awaited_once_with(
+            "12345", "https://example.com/a.png", caption="img", reply_to=None, metadata=meta
+        )
+        mock_target.send_animation.assert_awaited_once_with(
+            "12345", "https://example.com/a.gif", caption="gif", reply_to=None, metadata=meta
+        )
+        mock_target.send_image_file.assert_awaited_once_with(
+            "12345", "/tmp/a.png", caption="file-img", reply_to=None, metadata=meta
+        )
+        mock_target.send_video.assert_awaited_once_with(
+            "12345", "/tmp/a.mp4", caption="video", reply_to=None, metadata=meta
+        )
+        mock_target.send_document.assert_awaited_once_with(
+            "12345", "/tmp/a.pdf", caption="doc", file_name="a.pdf", reply_to=None, metadata=meta
         )
 
     @pytest.mark.asyncio

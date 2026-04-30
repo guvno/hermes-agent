@@ -285,6 +285,8 @@ class WebhookAdapter(BasePlatformAdapter):
                         "deliver": route_config.get("deliver", "log"),
                         "deliver_extra": route_config.get("deliver_extra", {}),
                         "payload": {},
+                        "voice_reply": bool(route_config.get("voice_reply", False)),
+                        "text_reply": route_config.get("text_reply", True),
                     }
                     logger.info(
                         "[webhook] Recovered %s config for %s from route %s",
@@ -296,6 +298,57 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.debug("[webhook] Could not recover %s config for %s", purpose, chat_id, exc_info=True)
         return delivery
 
+    def _resolve_delivery_target(
+        self,
+        chat_id: str,
+        *,
+        purpose: str = "delivery",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[tuple[BasePlatformAdapter, str, Dict[str, Any], str]]:
+        """Resolve a webhook chat_id to its configured target adapter/chat.
+
+        Returns ``(adapter, target_chat_id, target_metadata, deliver_type)`` or
+        ``None`` when the target is non-interactive/log-only/unavailable.
+        """
+        delivery = self._delivery_for_chat_id(chat_id, purpose=purpose)
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type in ("log", "github_comment") or not self.gateway_runner:
+            return None
+
+        try:
+            target_platform = Platform(deliver_type)
+        except ValueError:
+            return None
+
+        adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter:
+            return None
+
+        extra = delivery.get("deliver_extra", {}) or {}
+        target_chat_id = extra.get("chat_id", "")
+        if not target_chat_id:
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if not home:
+                return None
+            target_chat_id = home.chat_id
+
+        target_metadata: Dict[str, Any] = {}
+        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if thread_id:
+            target_metadata["thread_id"] = thread_id
+        if metadata:
+            target_metadata.update(metadata)
+
+        return adapter, str(target_chat_id), target_metadata, deliver_type
+
+    def delivery_platform_key_for_chat(self, chat_id: str) -> Optional[str]:
+        """Return the visible delivery platform for display-setting resolution."""
+        delivery = self._delivery_for_chat_id(chat_id, purpose="display delivery")
+        deliver_type = delivery.get("deliver")
+        if deliver_type and deliver_type not in ("log", "github_comment"):
+            return str(deliver_type)
+        return None
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Forward typing indicators to the configured delivery target.
 
@@ -306,39 +359,14 @@ class WebhookAdapter(BasePlatformAdapter):
         so voice-sphere and other webhook bridges show the same "typing..." UI
         as native platform messages.
         """
-        delivery = self._delivery_for_chat_id(chat_id, purpose="typing delivery")
-        deliver_type = delivery.get("deliver", "log")
-        if deliver_type in ("log", "github_comment"):
+        resolved = self._resolve_delivery_target(chat_id, purpose="typing delivery", metadata=metadata)
+        if not resolved:
             return
-        if not self.gateway_runner:
+        adapter, target_chat_id, target_metadata, deliver_type = resolved
+        if not hasattr(adapter, "send_typing"):
             return
-
         try:
-            target_platform = Platform(deliver_type)
-        except ValueError:
-            return
-
-        adapter = self.gateway_runner.adapters.get(target_platform)
-        if not adapter or not hasattr(adapter, "send_typing"):
-            return
-
-        extra = delivery.get("deliver_extra", {}) or {}
-        target_chat_id = extra.get("chat_id", "")
-        if not target_chat_id:
-            home = self.gateway_runner.config.get_home_channel(target_platform)
-            if not home:
-                return
-            target_chat_id = home.chat_id
-
-        target_metadata: Dict[str, Any] = {}
-        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
-        if thread_id:
-            target_metadata["thread_id"] = thread_id
-        if metadata:
-            target_metadata.update(metadata)
-
-        try:
-            await adapter.send_typing(str(target_chat_id), metadata=target_metadata or None)
+            await adapter.send_typing(target_chat_id, metadata=target_metadata or None)
         except Exception:
             logger.debug(
                 "[webhook] Failed to forward typing indicator to %s:%s",
@@ -346,6 +374,87 @@ class WebhookAdapter(BasePlatformAdapter):
                 target_chat_id,
                 exc_info=True,
             )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Forward streaming/tool-progress edits to the delivery target."""
+        resolved = self._resolve_delivery_target(chat_id, purpose="edit delivery")
+        if not resolved:
+            return SendResult(success=False, error="No webhook delivery target for edit")
+        adapter, target_chat_id, _target_metadata, _deliver_type = resolved
+        return await adapter.edit_message(
+            chat_id=target_chat_id,
+            message_id=message_id,
+            content=content,
+            finalize=finalize,
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Forward deletion of streamed preview/progress messages to the target."""
+        resolved = self._resolve_delivery_target(chat_id, purpose="delete delivery")
+        if not resolved:
+            return False
+        adapter, target_chat_id, _target_metadata, _deliver_type = resolved
+        try:
+            return bool(await adapter.delete_message(target_chat_id, message_id))
+        except Exception:
+            logger.debug("[webhook] Failed to forward delete_message", exc_info=True)
+            return False
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="voice delivery", metadata=kwargs.pop("metadata", None))
+        if not resolved:
+            return await super().send_voice(chat_id, audio_path, caption=caption, reply_to=reply_to, **kwargs)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_voice(target_chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=target_metadata or None, **kwargs)
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="tts playback", metadata=kwargs.pop("metadata", None))
+        if not resolved:
+            return await super().play_tts(chat_id, audio_path, **kwargs)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.play_tts(target_chat_id, audio_path, metadata=target_metadata or None, **kwargs)
+
+    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="image delivery", metadata=metadata)
+        if not resolved:
+            return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_image(target_chat_id, image_url, caption=caption, reply_to=reply_to, metadata=target_metadata or None)
+
+    async def send_animation(self, chat_id: str, animation_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="animation delivery", metadata=metadata)
+        if not resolved:
+            return await super().send_animation(chat_id, animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_animation(target_chat_id, animation_url, caption=caption, reply_to=reply_to, metadata=target_metadata or None)
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="image-file delivery", metadata=kwargs.pop("metadata", None))
+        if not resolved:
+            return await super().send_image_file(chat_id, image_path, caption=caption, reply_to=reply_to, **kwargs)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_image_file(target_chat_id, image_path, caption=caption, reply_to=reply_to, metadata=target_metadata or None, **kwargs)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="video delivery", metadata=kwargs.pop("metadata", None))
+        if not resolved:
+            return await super().send_video(chat_id, video_path, caption=caption, reply_to=reply_to, **kwargs)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_video(target_chat_id, video_path, caption=caption, reply_to=reply_to, metadata=target_metadata or None, **kwargs)
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        resolved = self._resolve_delivery_target(chat_id, purpose="document delivery", metadata=kwargs.pop("metadata", None))
+        if not resolved:
+            return await super().send_document(chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to, **kwargs)
+        adapter, target_chat_id, target_metadata, _deliver_type = resolved
+        return await adapter.send_document(target_chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to, metadata=target_metadata or None, **kwargs)
 
     async def send_exec_approval(
         self,
