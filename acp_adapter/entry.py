@@ -13,6 +13,18 @@ Usage::
     hermes-acp
 """
 
+# IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
+# on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
+try:
+    import hermes_bootstrap  # noqa: F401
+except ModuleNotFoundError:
+    # Graceful fallback when hermes_bootstrap isn't registered in the venv
+    # yet — happens during partial ``hermes update`` where git-reset landed
+    # new code but ``uv pip install -e .`` didn't finish.  Missing bootstrap
+    # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
+    pass
+
+import argparse
 import asyncio
 import logging
 import sys
@@ -96,8 +108,62 @@ def _load_env() -> None:
         )
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="hermes-acp",
+        description="Run Hermes Agent as an ACP stdio server.",
+    )
+    parser.add_argument("--version", action="store_true", help="Print Hermes version and exit")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify ACP dependencies and adapter imports, then exit",
+    )
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run interactive Hermes provider/model setup for ACP terminal auth",
+    )
+    return parser.parse_args(argv)
+
+
+def _print_version() -> None:
+    from hermes_cli import __version__ as hermes_version
+
+    print(hermes_version)
+
+
+def _run_check() -> None:
+    import acp  # noqa: F401
+    from acp_adapter.server import HermesACPAgent  # noqa: F401
+
+    print("Hermes ACP check OK")
+
+
+def _run_setup() -> None:
+    from hermes_cli.main import main as hermes_main
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [old_argv[0] if old_argv else "hermes", "model"]
+        hermes_main()
+    finally:
+        sys.argv = old_argv
+
+
+def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
+    args = _parse_args(argv)
+    if args.version:
+        _print_version()
+        return
+    if args.check:
+        _run_check()
+        return
+    if args.setup:
+        _run_setup()
+        return
+
     _setup_logging()
     _load_env()
 
