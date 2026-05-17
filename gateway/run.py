@@ -7749,6 +7749,10 @@ class GatewayRunner:
                 from tools.process_registry import process_registry
                 while process_registry.pending_watchers:
                     watcher = process_registry.pending_watchers.pop(0)
+                    if not watcher.get("event_message_id"):
+                        event_message_id = self._reply_anchor_for_event(event)
+                        if event_message_id:
+                            watcher["event_message_id"] = str(event_message_id)
                     asyncio.create_task(self._run_process_watcher(watcher))
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
@@ -13312,16 +13316,34 @@ class GatewayRunner:
         from gateway.session import SessionSource
 
         session_key = str(evt.get("session_key") or "").strip()
+        event_message_id = str(
+            evt.get("event_message_id")
+            or evt.get("message_id")
+            or evt.get("reply_to_message_id")
+            or ""
+        ).strip() or None
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+
+        def _with_event_message_id(source):
+            if not source or not event_message_id:
+                return source
+            try:
+                return dataclasses.replace(source, message_id=event_message_id)
+            except Exception:
+                try:
+                    source.message_id = event_message_id
+                except Exception:
+                    pass
+                return source
 
         if session_key:
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _with_event_message_id(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -13331,7 +13353,7 @@ class GatewayRunner:
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _with_event_message_id(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -13371,6 +13393,7 @@ class GatewayRunner:
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            message_id=event_message_id,
         )
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
@@ -13434,6 +13457,12 @@ class GatewayRunner:
         thread_id = watcher.get("thread_id", "")
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
+        event_message_id = str(
+            watcher.get("event_message_id")
+            or watcher.get("message_id")
+            or watcher.get("reply_to_message_id")
+            or ""
+        ).strip()
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -13482,6 +13511,7 @@ class GatewayRunner:
                         "platform": platform_name,
                         "chat_id": chat_id,
                         "thread_id": thread_id,
+                        "event_message_id": event_message_id,
                         "user_id": user_id,
                         "user_name": user_name,
                     })

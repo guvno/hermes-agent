@@ -879,6 +879,45 @@ def test_lobby_reminder_is_debounced_per_chat(tmp_path):
     assert runner._should_send_telegram_lobby_reminder(other) is True
 
 
+def test_background_process_source_keeps_telegram_dm_topic_reply_anchor():
+    """Synthetic process completions need a reply anchor to stay visible in DM topics."""
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:208214988:17585"
+    runner.session_store._entries = {
+        session_key: SessionEntry(
+            session_key=session_key,
+            session_id="sess-topic",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            origin=SessionSource(
+                platform=Platform.TELEGRAM,
+                user_id="208214988",
+                chat_id="208214988",
+                user_name="tester",
+                chat_type="dm",
+                thread_id="17585",
+                message_id="old-anchor",
+            ),
+        )
+    }
+    runner.session_store._ensure_loaded = MagicMock()
+
+    source = runner._build_process_event_source({
+        "session_key": session_key,
+        "event_message_id": "m1",
+    })
+    metadata = runner._thread_metadata_for_source(source)
+
+    assert source.message_id == "m1"
+    assert metadata == {
+        "thread_id": "17585",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "m1",
+    }
+
+
 def test_binding_survives_session_deletion_via_cascade(tmp_path):
     """Deleting a session with a topic binding must not raise FK errors."""
     import sqlite3
