@@ -216,6 +216,54 @@ class TestRecordFileMutationResult:
 
         assert agent._turn_failed_file_mutations == {}
 
+    def test_landed_write_with_appended_toolguard_guidance_clears_prior_failure(self):
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": "/tmp/a.py", "content": "bad"},
+            json.dumps({"error": "write failed"}),
+            is_error=True,
+        )
+        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+
+        result = (
+            json.dumps({"bytes_written": 12, "lint": {"status": "error"}})
+            + "\n\n[Tool loop warning: same_tool_failure_warning; count=3; recover before retrying]"
+        )
+
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": "/tmp/a.py", "content": "def nope(:\n"},
+            result,
+            is_error=True,
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_landed_patch_with_appended_toolguard_guidance_clears_prior_failure(self):
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.py", "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+
+        result = (
+            json.dumps({"success": True, "diff": "--- a/tmp.py\n+++ b/tmp.py\n"})
+            + "\n\n[Tool loop warning: same_tool_failure_warning; count=3; recover before retrying]"
+        )
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.py", "old_string": "x", "new_string": "y"},
+            result,
+            is_error=True,
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
     def test_repeated_failure_keeps_first_error(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(
